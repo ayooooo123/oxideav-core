@@ -1,5 +1,7 @@
 //! Compressed-data packet passed between demuxer → decoder and encoder → muxer.
 
+use std::sync::Arc;
+
 use crate::time::TimeBase;
 
 /// Metadata flags on a packet.
@@ -18,6 +20,53 @@ pub struct PacketFlags {
     /// signal to recreate similar boundaries in their output. Decoders
     /// should ignore it.
     pub unit_boundary: bool,
+}
+
+/// Container information associated with one emitted packet, independent of
+/// the compressed bitstream's parser flags.
+///
+/// Capture this immediately after a successful
+/// [`Demuxer::next_packet`](crate::Demuxer::next_packet), before reading or
+/// seeking again. Carry the snapshot with the packet through pipeline queues:
+/// equal timestamps do not imply equal metadata, especially for laced packets.
+/// The default value allocates nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PacketMetadata {
+    /// The container identifies this packet as a random-access point even if
+    /// a bitstream parser does not mark it as a keyframe. Seek gates may use
+    /// this together with [`PacketFlags::keyframe`]; do not rewrite parser
+    /// flags merely to transport the container's indication.
+    pub container_keyframe: bool,
+    /// Priming and padding to remove from decoded audio, never encoded data.
+    pub audio_trim: Option<AudioTrim>,
+    /// WebVTT cue identifier and settings removed from the packet's text.
+    pub webvtt: Option<Arc<WebVttMetadata>>,
+}
+
+/// Per-channel sample counts to discard after decoding the associated packet.
+///
+/// Decode priming data normally so codec state is established. A leading skip
+/// may span multiple decoded frames; do not clamp it to one frame. Consumers
+/// must preserve packet/output association for delayed and many-frame decoders,
+/// rescale counts to the actual output rate, and apply each trim only once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioTrim {
+    /// Leading decoded samples to skip, potentially across several frames.
+    pub skip_samples: u32,
+    /// Trailing decoded samples to discard from the packet's output.
+    pub discard_padding: u32,
+    /// Nonzero sample rate in which both counts are expressed.
+    pub sample_rate: u32,
+}
+
+/// Raw WebVTT cue side data. Neither field is part of the displayed cue text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebVttMetadata {
+    /// Cue identifier bytes, without the separating newline.
+    pub identifier: Vec<u8>,
+    /// Cue settings bytes, without the separating newline.
+    pub settings: Vec<u8>,
 }
 
 /// A chunk of compressed (encoded) data belonging to one stream.

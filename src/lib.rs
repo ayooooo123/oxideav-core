@@ -71,7 +71,7 @@ pub use metadata::{Attachment, Chapter};
 pub use options::{
     parse_options, CodecOptions, CodecOptionsStruct, OptionField, OptionKind, OptionValue,
 };
-pub use packet::Packet;
+pub use packet::{AudioTrim, Packet, PacketMetadata, WebVttMetadata};
 pub use picture::{AttachedPicture, PictureType};
 pub use rational::Rational;
 pub use registry::{

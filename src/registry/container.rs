@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::{CodecResolver, Error, Packet, Result, StreamInfo};
+use crate::{CodecResolver, Error, Packet, PacketMetadata, Result, StreamInfo};
 
 // ───────────────────────── traits ─────────────────────────
 
@@ -23,6 +23,17 @@ pub trait Demuxer: Send {
 
     /// Read the next packet from any stream. Returns `Error::Eof` at end.
     fn next_packet(&mut self) -> Result<Packet>;
+
+    /// Owned side data for the last successfully emitted packet.
+    ///
+    /// Read this immediately after `next_packet`, before another read or seek,
+    /// and retain it with that packet, not in a timestamp-keyed lookup.
+    /// Implementations clear exposed metadata before reading or seeking, so
+    /// an error or EOF cannot expose the previous packet's information.
+    /// Containers without packet side data use the allocation-free default.
+    fn packet_metadata(&self) -> PacketMetadata {
+        PacketMetadata::default()
+    }
 
     /// Hint that only the listed stream indices will be consumed by the
     /// pipeline. Demuxers that can efficiently skip inactive streams at

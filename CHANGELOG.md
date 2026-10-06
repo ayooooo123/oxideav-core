@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Demuxer::packet_metadata()` returns owned per-packet side data without
+  changing public `Packet` literals: a separate container random-access
+  indication, per-channel audio trim counts/rate, and shared WebVTT cue
+  identifiers/settings. Empty metadata allocates nothing. Consumers snapshot
+  it immediately after a successful packet read; producers clear exposure
+  before another read or seek.
 - `VideoFrame::display_duration()` / `set_display_duration` /
   `with_display_duration` / `take_display_duration` — a fifth in-band
   side-channel record (`stride == usize::MAX - 3`, 12 bytes: big-endian
