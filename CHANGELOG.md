@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `VideoFrame::display_duration()` / `set_display_duration` /
+  `with_display_duration` / `take_display_duration` — a fifth in-band
+  side-channel record (`stride == usize::MAX - 3`, 12 bytes: big-endian
+  `u64` seconds + `u32` nanoseconds) carrying how long a picture stays
+  on screen from its `pts`, for bitmap subtitle decoders whose
+  bitstream gives the end time when the frame is emitted (DVD stop
+  command, DVB page time-out). Frames without it are unchanged.
+
 ## [0.1.37](https://github.com/OxideAV/oxideav-core/compare/v0.1.36...v0.1.37) - 2026-09-27
 
 ### Other

@@ -89,7 +89,7 @@ pub struct AudioFrame {
 /// zero stride forces empty data) or a value above `isize::MAX`
 /// (`stride × rows` with any non-zero row count would exceed what a
 /// `Vec` can hold). The whole `stride > isize::MAX` band is reserved
-/// for side-channel tags. Four record kinds exist, distinguished by
+/// for side-channel tags. Five record kinds exist, distinguished by
 /// their `stride` tag:
 ///
 /// - **Palette** — `stride == 0`. Carries the color table for
@@ -111,6 +111,11 @@ pub struct AudioFrame {
 ///   [`LayerIdentity`] (layer / view / access-unit) for frames of
 ///   multi-layer or multi-view streams; see [`layer`](Self::layer) /
 ///   [`set_layer`](Self::set_layer).
+/// - **Display duration** — `stride == usize::MAX - 3`. Carries how
+///   long the picture stays on screen from its `pts`, for producers
+///   that know it when they emit the frame (bitmap subtitles with an
+///   end time); see [`display_duration`](Self::display_duration) /
+///   [`set_display_duration`](Self::set_display_duration).
 ///
 /// The records compose: a frame can carry any subset at once, in any
 /// order, within the trailing run of side-channel-shaped entries. The
@@ -134,8 +139,8 @@ pub struct VideoFrame {
     /// One entry per plane (e.g., 3 for Yuv420P). Each entry is `(stride, bytes)`.
     ///
     /// May additionally end with side-channel entries (palette,
-    /// per-plane significant bits, colour signal, layer identity — see
-    /// the type-level docs). Code that
+    /// per-plane significant bits, colour signal, layer identity,
+    /// display duration — see the type-level docs). Code that
     /// wants only pixel planes should iterate
     /// [`image_planes`](Self::image_planes) instead of this field.
     pub planes: Vec<VideoPlane>,
@@ -150,6 +155,9 @@ const COLOR_SIGNAL_STRIDE: usize = usize::MAX - 1;
 
 /// `stride` tag of the layer-identity side-channel record.
 const LAYER_IDENTITY_STRIDE: usize = usize::MAX - 2;
+
+/// `stride` tag of the display-duration side-channel record.
+const DISPLAY_DURATION_STRIDE: usize = usize::MAX - 3;
 
 /// Smallest `stride` value that is impossible for an image plane with
 /// at least one row: `stride × rows` would exceed `isize::MAX`, the
@@ -427,9 +435,58 @@ impl VideoFrame {
             .and_then(|d| LayerIdentity::from_bytes(&d))
     }
 
+    /// How long the frame stays on screen from its `pts`, if the
+    /// producer knows it when it emits the frame.
+    ///
+    /// Decoded from the display-duration side-channel record (see the
+    /// type-level docs): 12 bytes, whole seconds as a big-endian `u64`
+    /// then the sub-second nanoseconds as a big-endian `u32`. Bitmap
+    /// subtitle decoders attach it when the bitstream carries an end
+    /// time (a DVD stop command, a DVB page time-out); a frame without
+    /// it stays until the next frame of its stream replaces it. A
+    /// malformed record (wrong length, nanoseconds out of range) reads
+    /// as `None`.
+    pub fn display_duration(&self) -> Option<std::time::Duration> {
+        let data = &self.planes[self.side_channel_index(DISPLAY_DURATION_STRIDE)?].data;
+        let secs = u64::from_be_bytes(data.get(..8)?.try_into().ok()?);
+        let nanos = u32::from_be_bytes(data.get(8..12)?.try_into().ok()?);
+        (data.len() == 12 && nanos < 1_000_000_000).then(|| std::time::Duration::new(secs, nanos))
+    }
+
+    /// Attach (or replace) the frame's display-duration side-channel.
+    /// Other side-channel records are unaffected.
+    pub fn set_display_duration(&mut self, duration: std::time::Duration) {
+        self.remove_side_channel(DISPLAY_DURATION_STRIDE);
+        let mut data = Vec::with_capacity(12);
+        data.extend_from_slice(&duration.as_secs().to_be_bytes());
+        data.extend_from_slice(&duration.subsec_nanos().to_be_bytes());
+        self.planes.push(VideoPlane {
+            stride: DISPLAY_DURATION_STRIDE,
+            data,
+        });
+    }
+
+    /// Builder-style counterpart to
+    /// [`set_display_duration`](Self::set_display_duration) for
+    /// construction chains:
+    /// `VideoFrame { pts, planes }.with_display_duration(d)`.
+    pub fn with_display_duration(mut self, duration: std::time::Duration) -> Self {
+        self.set_display_duration(duration);
+        self
+    }
+
+    /// Detach and return the frame's display-duration side-channel, if
+    /// any. Afterwards the frame carries no display duration (other
+    /// records are left in place).
+    pub fn take_display_duration(&mut self) -> Option<std::time::Duration> {
+        let duration = self.display_duration();
+        self.remove_side_channel(DISPLAY_DURATION_STRIDE);
+        duration
+    }
+
     /// The frame's image planes — `planes` with the trailing
     /// side-channel entries (palette, significant bits, colour signal,
-    /// layer identity) excluded.
+    /// layer identity, display duration) excluded.
     /// Prefer this over indexing `planes` directly in code that
     /// handles side-channel-capable frames.
     pub fn image_planes(&self) -> &[VideoPlane] {
@@ -450,9 +507,9 @@ impl VideoFrame {
 ///
 /// An entry with non-empty `data` and a `stride` of `0` or above
 /// `isize::MAX` is not an image plane: it is a side-channel record
-/// (palette, per-plane significant bits, colour signal, layer identity)
-/// described on [`VideoFrame`] — only meaningful within the trailing
-/// run of `VideoFrame::planes`.
+/// (palette, per-plane significant bits, colour signal, layer identity,
+/// display duration) described on [`VideoFrame`] — only meaningful
+/// within the trailing run of `VideoFrame::planes`.
 #[derive(Clone, Debug)]
 pub struct VideoPlane {
     /// Bytes per row in `data`.
@@ -944,6 +1001,74 @@ mod tests {
             assert_eq!(v.palette().map(<[u8]>::len), Some(768));
         } else {
             unreachable!("wrapped as Video above");
+        }
+    }
+
+    #[test]
+    fn set_display_duration_round_trips_and_keeps_image_planes_intact() {
+        use std::time::Duration;
+        let mut f = gray_frame();
+        assert_eq!(f.display_duration(), None);
+        f.set_display_duration(Duration::from_millis(4960));
+        assert_eq!(f.display_duration(), Some(Duration::from_millis(4960)));
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.planes[1].stride, usize::MAX - 3);
+
+        // Replacing keeps one record; the full range round-trips.
+        let long = Duration::new(u64::MAX, 999_999_999);
+        f.set_display_duration(long);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.display_duration(), Some(long));
+        f.set_display_duration(Duration::ZERO);
+        assert_eq!(f.display_duration(), Some(Duration::ZERO));
+
+        assert_eq!(f.take_display_duration(), Some(Duration::ZERO));
+        assert_eq!(f.display_duration(), None);
+        assert_eq!(f.take_display_duration(), None);
+        assert_eq!(f.planes.len(), 1);
+    }
+
+    #[test]
+    fn display_duration_composes_with_the_other_side_channels() {
+        use std::time::Duration;
+        let id = LayerIdentity::new(1);
+        let mut f = gray_frame()
+            .with_display_duration(Duration::from_secs(15))
+            .with_palette(vec![1, 2, 3])
+            .with_layer(id);
+        assert_eq!(f.planes.len(), 4);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.display_duration(), Some(Duration::from_secs(15)));
+        assert_eq!(f.take_palette(), Some(vec![1, 2, 3]));
+        assert_eq!(f.display_duration(), Some(Duration::from_secs(15)));
+        assert_eq!(f.layer(), Some(id));
+        let wrapped = Frame::Video(f.clone());
+        let Frame::Video(v) = wrapped else { unreachable!("wrapped as Video above") };
+        assert_eq!(v.display_duration(), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn malformed_display_duration_reads_as_none() {
+        let record = |data: Vec<u8>| VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![0u8; 8],
+                },
+                VideoPlane {
+                    stride: usize::MAX - 3,
+                    data,
+                },
+            ],
+        };
+        // Too short, too long, nanoseconds out of range: excluded from the
+        // image planes but decoding to nothing.
+        for data in [vec![0u8; 11], vec![0u8; 13], [&[0u8; 8][..], &1_000_000_000u32.to_be_bytes()].concat()] {
+            let f = record(data);
+            assert_eq!(f.image_plane_count(), 1);
+            assert_eq!(f.display_duration(), None);
         }
     }
 }
