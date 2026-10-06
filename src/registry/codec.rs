@@ -146,6 +146,30 @@ pub trait Decoder: Send {
     fn output_pixel_format(&self) -> Option<crate::PixelFormat> {
         None
     }
+    /// Layout of the audio frames this decoder emits: sample format,
+    /// sample rate and channel count, which can differ from the
+    /// container's declaration (HE-AAC doubles the rate, parametric
+    /// stereo doubles the channels, many decoders emit S16 or planar
+    /// float whatever the container says). [`AudioFrame`](crate::AudioFrame)
+    /// carries none of these, so a consumer that converts samples needs
+    /// them from here. Returns `None` until known; decoders that learn the
+    /// layout from the bitstream should return it no later than when the
+    /// first frame is available from `receive_frame`.
+    /// Default `None` ("unknown — trust the stream parameters").
+    fn output_audio_format(&self) -> Option<AudioFormat> {
+        None
+    }
+}
+
+/// What [`Decoder::output_audio_format`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AudioFormat {
+    /// Sample encoding and planarity of `AudioFrame::data`.
+    pub sample_format: crate::SampleFormat,
+    /// Samples per second per channel.
+    pub sample_rate: u32,
+    /// Channel count: planes for planar formats, interleave stride otherwise.
+    pub channels: u16,
 }
 
 /// A frame-to-packet encoder.

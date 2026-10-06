@@ -12,7 +12,7 @@ pub mod slice;
 pub mod source;
 
 pub use codec::{
-    CodecImplementation, CodecInfo, CodecRegistry, Decoder, DecoderFactory, Encoder,
+    AudioFormat, CodecImplementation, CodecInfo, CodecRegistry, Decoder, DecoderFactory, Encoder,
     EncoderFactory, PayloadMagicCandidate, TagCandidate,
 };
 pub use container::{
