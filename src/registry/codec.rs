@@ -146,6 +146,22 @@ pub trait Decoder: Send {
     fn output_pixel_format(&self) -> Option<crate::PixelFormat> {
         None
     }
+
+    /// Nonzero visible dimensions of the video this decoder produces,
+    /// after codec cropping and excluding stride padding.
+    ///
+    /// After receiving a video frame, this describes that returned frame,
+    /// not a newer sequence header waiting in the input queue. Before the
+    /// first frame, a decoder may report dimensions from its validated
+    /// sequence header so consumers can configure output without waiting
+    /// for end-of-stream. Never infer visible width from a plane's stride.
+    ///
+    /// Default `None` means the decoder has no authoritative dimensions;
+    /// consumers may still use dimensions declared by the container.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Layout of the audio frames this decoder emits: sample format,
     /// sample rate and channel count, which can differ from the
     /// container's declaration (HE-AAC doubles the rate, parametric

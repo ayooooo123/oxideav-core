@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Decoder::output_video_dimensions()` exposes authoritative visible geometry
+  without guessing from strides or extending frame literals. Its compatible
+  default is `None`; implementations can report validated startup headers and
+  must associate later dimensions with the frame most recently returned.
 - `Demuxer::packet_metadata()` returns owned per-packet side data without
   changing public `Packet` literals: a separate container random-access
   indication, per-channel audio trim counts/rate, and shared WebVTT cue
