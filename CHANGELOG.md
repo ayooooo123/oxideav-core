@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `PixelFormat::Yuv410P` (discriminant 70): 8-bit planar 4:1:0, chroma a
+  quarter of the width and of the height (FFmpeg's `yuv410p`: Sorenson
+  Video 1, Indeo 2/3).
 - `Decoder::output_video_dimensions()` exposes authoritative visible geometry
   without guessing from strides or extending frame literals. Its compatible
   default is `None`; implementations can report validated startup headers and
