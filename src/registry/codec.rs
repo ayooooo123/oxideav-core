@@ -416,9 +416,13 @@ impl CodecInfo {
         self
     }
 
-    /// Builder: attach the encoder factory.
+    /// Builder: attach the encoder factory. With the `decode-only`
+    /// feature the factory is dropped, so `make_encoder` stays unreferenced.
+    #[inline]
     pub fn encoder(mut self, factory: EncoderFactory) -> Self {
-        self.encoder_factory = Some(factory);
+        if !cfg!(feature = "decode-only") {
+            self.encoder_factory = Some(factory);
+        }
         self
     }
 
@@ -665,9 +669,19 @@ impl CodecRegistry {
             engine_probe,
             resolution_priority,
         } = info;
+        // `decode-only`: an encoder set on the struct directly (not through
+        // the builder) is ignored too, with its schema and encode flag.
+        let (encoder_factory, encoder_options_schema) = if cfg!(feature = "decode-only") {
+            (None, None)
+        } else {
+            (encoder_factory, encoder_options_schema)
+        };
 
         let caps = {
             let mut c = capabilities;
+            if cfg!(feature = "decode-only") {
+                c.encode = false;
+            }
             if decoder_factory.is_some() {
                 c = c.with_decode();
             }
@@ -1694,6 +1708,32 @@ mod resolution_order_tests {
         assert_eq!(reg.resolve_tag_ref(&pc).map(|c| c.as_str()), Some("sw-id"));
         let cands = reg.resolve_tag_candidates(&pc);
         assert!(cands.iter().all(|c| c.priority == crate::DEFAULT_PRIORITY));
+    }
+
+    /// `decode-only`: encoders vanish however they are attached; decoders,
+    /// tags and an encoder-only id's tag claim stay.
+    #[cfg(feature = "decode-only")]
+    #[test]
+    fn decode_only_registers_no_encoder() {
+        let mut reg = CodecRegistry::new();
+        let caps = CodecCapabilities::audio("both").with_encode();
+        reg.register(info("both").capabilities(caps).decoder(dec).encoder(enc).tag(CodecTag::fourcc(b"BOTH")));
+        let mut direct = info("direct").decoder(dec);
+        direct.encoder_factory = Some(enc);
+        reg.register(direct);
+        reg.register(info("enc-only").encoder(enc).tag(CodecTag::fourcc(b"ENCO")));
+
+        assert_eq!(reg.decoder_ids().map(|i| i.as_str()).collect::<Vec<_>>(), vec!["both", "direct"]);
+        assert_eq!(reg.encoder_ids().count(), 0);
+        for id in ["both", "direct"] {
+            let impls = reg.implementations(&CodecId::new(id));
+            assert_eq!(impls.len(), 1);
+            assert!(impls[0].make_encoder.is_none() && !impls[0].caps.encode && impls[0].caps.decode);
+        }
+        assert!(reg.implementations(&CodecId::new("enc-only")).is_empty());
+        let tag = CodecTag::fourcc(b"ENCO");
+        let pc = ProbeContext::new(&tag);
+        assert_eq!(reg.resolve_tag_ref(&pc).map(|c| c.as_str()), Some("enc-only"));
     }
 }
 

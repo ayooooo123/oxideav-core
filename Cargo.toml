@@ -19,6 +19,11 @@ default = []
 # `serde_json::Value`). Consumers that previously gated on this can
 # drop the feature flag entirely.
 json-options = []
+# For players: `CodecInfo::encoder` and `ContainerRegistry::register_muxer`
+# drop their factories, so a sibling's `register` no longer references its
+# encoder or muxer and link-time optimisation can discard that code. The
+# registry then behaves as if no encoder or muxer had been registered.
+decode-only = []
 
 [dependencies]
 thiserror = "2"

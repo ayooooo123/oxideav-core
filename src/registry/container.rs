@@ -283,7 +283,11 @@ impl ContainerRegistry {
 
     /// Register a muxer factory under a container format name. Same
     /// replacement contract as [`register_demuxer`](Self::register_demuxer).
+    /// A no-op with the `decode-only` feature, so `open` stays unreferenced.
     pub fn register_muxer(&mut self, name: &str, open: OpenMuxerFn) {
+        if cfg!(feature = "decode-only") {
+            return;
+        }
         match self.muxers.iter_mut().find(|(n, _)| n == name) {
             Some(slot) => slot.1 = open,
             None => self.muxers.push((name.to_owned(), open)),
@@ -892,5 +896,20 @@ mod tests {
         assert!(d.attached_pictures().is_empty());
         assert!(d.metadata().is_empty());
         assert_eq!(d.duration_micros(), None);
+    }
+
+    /// `decode-only`: muxers are not registered; demuxers are.
+    #[cfg(feature = "decode-only")]
+    #[test]
+    fn decode_only_registers_no_muxer() {
+        let mut reg = ContainerRegistry::new();
+        reg.register_demuxer("both", open_dummy);
+        reg.register_muxer("both", open_dummy_mux);
+        assert_eq!(reg.demuxer_names().collect::<Vec<_>>(), vec!["both"]);
+        assert_eq!(reg.muxer_names().count(), 0);
+        assert!(matches!(
+            reg.open_muxer("both", Box::new(std::io::Cursor::new(Vec::new())), &[]),
+            Err(Error::FormatNotFound(_))
+        ));
     }
 }
