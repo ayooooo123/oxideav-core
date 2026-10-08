@@ -1648,6 +1648,8 @@ mod resolution_order_tests {
         Err(Error::unsupported("dummy"))
     }
 
+    // Registers and lists encoders, which `decode-only` drops.
+    #[cfg(not(feature = "decode-only"))]
     #[test]
     fn enumerations_follow_registration_order() {
         for _ in 0..200 {

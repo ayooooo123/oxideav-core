@@ -845,6 +845,8 @@ mod tests {
         Err(Error::unsupported("dummy muxer"))
     }
 
+    // Registers and lists muxers, which `decode-only` drops.
+    #[cfg(not(feature = "decode-only"))]
     #[test]
     fn name_listings_follow_registration_order_and_replace_in_place() {
         const ORDER: [&str; 5] = ["zeta", "alpha", "omicron", "beta", "kappa"];
