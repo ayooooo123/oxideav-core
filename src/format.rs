@@ -560,6 +560,11 @@ pub enum PixelFormat {
     /// NTSC DV-25 and a legal JPEG sampling layout (luma H=4, V=1;
     /// chroma H=V=1) emitted by some real-world JPEG corpora.
     Yuv411P = 34,
+    /// 8-bit YUV 4:1:0, planar (Y, U, V). Luma at full resolution;
+    /// chroma subsampled by 4 on both axes (each chroma sample covers a
+    /// 4×4 luma block). FFmpeg's `yuv410p`: Sorenson Video 1 and
+    /// Indeo 2/3 decode to it.
+    Yuv410P = 70,
 
     // --- Planar GBR / GBRA (RGB stored as planes in G,B,R order) ---
     //
@@ -836,6 +841,7 @@ impl PixelFormat {
                 | Self::Yuv422P16Le
                 | Self::Yuv444P16Le
                 | Self::Yuv440P
+                | Self::Yuv410P
                 | Self::Yuv440P10Le
                 | Self::Yuv440P12Le
                 | Self::Yuv440P16Le
@@ -963,6 +969,7 @@ impl PixelFormat {
             | Self::Yuv422P16Le
             | Self::Yuv444P16Le
             | Self::Yuv440P
+            | Self::Yuv410P
             | Self::Yuv440P10Le
             | Self::Yuv440P12Le
             | Self::Yuv440P16Le
@@ -1026,6 +1033,8 @@ impl PixelFormat {
             // 4:4:0 packs the same 2 samples/pixel as 4:2:2 (Y at full
             // res + 2 chroma planes at half height, full width).
             Self::Yuv440P => 16,
+            // 4:1:0: luma plus 2 chroma planes at 1/16 resolution each.
+            Self::Yuv410P => 9,
             Self::Yuv444P | Self::YuvJ444P => 24,
             Self::Yuv420P10Le | Self::Yuv420P12Le | Self::Yuv420P16Le => 24,
             Self::Yuv422P10Le | Self::Yuv422P12Le | Self::Yuv422P16Le => 32,
@@ -1144,6 +1153,8 @@ impl PixelFormat {
             | Self::Yuva444P16Le => Some((0, 0)),
             // 4:1:1 — quarter width, full height.
             Self::Yuv411P => Some((2, 0)),
+            // 4:1:0 — quarter width, quarter height.
+            Self::Yuv410P => Some((2, 2)),
             // 4:4:0 — full width, half height.
             Self::Yuv440P | Self::Yuv440P10Le | Self::Yuv440P12Le | Self::Yuv440P16Le => {
                 Some((0, 1))
@@ -1223,6 +1234,7 @@ impl PixelFormat {
             | Self::Yuv444P
             | Self::Yuv411P
             | Self::Yuv440P
+            | Self::Yuv410P
             | Self::YuvJ420P
             | Self::YuvJ422P
             | Self::YuvJ444P
@@ -1442,6 +1454,7 @@ mod tests {
         assert_eq!(PixelFormat::RgbaF32Le as u16, 67);
         assert_eq!(PixelFormat::GbrpF32Le as u16, 68);
         assert_eq!(PixelFormat::GbrapF32Le as u16, 69);
+        assert_eq!(PixelFormat::Yuv410P as u16, 70);
     }
 
     #[test]
@@ -2025,7 +2038,7 @@ mod tests {
     /// Every `PixelFormat` variant, in discriminant order. Extend this
     /// list whenever a variant is appended — the consistency tests
     /// below sweep it.
-    const ALL_PIXEL_FORMATS: [PixelFormat; 70] = [
+    const ALL_PIXEL_FORMATS: [PixelFormat; 71] = [
         PixelFormat::Yuv420P,
         PixelFormat::Yuv422P,
         PixelFormat::Yuv444P,
@@ -2096,11 +2109,12 @@ mod tests {
         PixelFormat::RgbaF32Le,
         PixelFormat::GbrpF32Le,
         PixelFormat::GbrapF32Le,
+        PixelFormat::Yuv410P,
     ];
 
     #[test]
     fn all_pixel_formats_list_is_complete_and_distinct() {
-        // The list is discriminant-ordered and dense: 0..70 with no
+        // The list is discriminant-ordered and dense: 0..71 with no
         // gaps and no duplicates. A newly appended variant that isn't
         // added to the list will break the length or density check.
         let mut seen = std::collections::HashSet::new();
@@ -2312,6 +2326,7 @@ mod tests {
         assert_eq!(Yuva444P12Le.chroma_subsampling(), Some((0, 0)));
         assert_eq!(Yuv411P.chroma_subsampling(), Some((2, 0)));
         assert_eq!(Yuv440P.chroma_subsampling(), Some((0, 1)));
+        assert_eq!(Yuv410P.chroma_subsampling(), Some((2, 2)));
         assert_eq!(Yuv440P16Le.chroma_subsampling(), Some((0, 1)));
         for fmt in [
             Gray8,
@@ -2347,6 +2362,10 @@ mod tests {
         // 4:1:1 — width ceil-quartered.
         assert_eq!(Yuv411P.plane_dimensions(1, 7, 5), Some((2, 5)));
         assert_eq!(Yuv411P.plane_dimensions(1, 9, 5), Some((3, 5)));
+        // 4:1:0 — both axes ceil-quartered (Sorenson Video 1's 293x178
+        // has 74x45 chroma).
+        assert_eq!(Yuv410P.plane_dimensions(1, 7, 5), Some((2, 2)));
+        assert_eq!(Yuv410P.plane_dimensions(2, 293, 178), Some((74, 45)));
         // 4:4:4 — untouched.
         assert_eq!(Yuv444P.plane_dimensions(1, 7, 5), Some((7, 5)));
         // Semi-planar chroma positions.

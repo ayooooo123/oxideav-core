@@ -504,7 +504,7 @@ fn video_frame_side_channels_match_two_option_model() {
 
 /// Every `PixelFormat` variant, in discriminant order (mirrors the
 /// in-crate unit-test list; extend on every appended variant).
-const ALL_PIXEL_FORMATS: [PixelFormat; 70] = [
+const ALL_PIXEL_FORMATS: [PixelFormat; 71] = [
     PixelFormat::Yuv420P,
     PixelFormat::Yuv422P,
     PixelFormat::Yuv444P,
@@ -575,6 +575,7 @@ const ALL_PIXEL_FORMATS: [PixelFormat; 70] = [
     PixelFormat::RgbaF32Le,
     PixelFormat::GbrpF32Le,
     PixelFormat::GbrapF32Le,
+    PixelFormat::Yuv410P,
 ];
 
 /// An edge-biased picture dimension: 0, 1, tiny odds, and sizes around
