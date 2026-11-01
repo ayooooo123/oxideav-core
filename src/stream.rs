@@ -1,5 +1,6 @@
 //! Stream metadata shared between containers and codecs.
 
+use crate::blob::{BlobKind, MetadataBlob};
 use crate::format::{ChannelLayout, MediaType, PixelFormat, SampleFormat};
 use crate::layer::LayerInfo;
 use crate::limits::DecoderLimits;
@@ -328,10 +329,12 @@ impl CodecResolver for NullCodecResolver {
 /// Codec-level parameters shared between demuxer/muxer and en/decoder.
 ///
 /// **Marked `#[non_exhaustive]`** — construction via struct-literal
-/// syntax is not supported. Use the [`audio`](Self::audio) /
-/// [`video`](Self::video) constructors (or functional-update
-/// `CodecParameters { ..base }` syntax) so new fields can be added
-/// without another semver break.
+/// syntax (including functional-update `CodecParameters { ..base }`)
+/// is not possible outside this crate. Use the [`audio`](Self::audio) /
+/// [`video`](Self::video) / [`subtitle`](Self::subtitle) /
+/// [`data`](Self::data) constructors, the `with_*` builders and direct
+/// field assignment, so new fields can be added without another semver
+/// break.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CodecParameters {
@@ -471,6 +474,27 @@ pub struct CodecParameters {
     /// [`VideoFrame::layer`](crate::VideoFrame::layer) for the
     /// per-frame identity that pairs with it.
     pub layers: Vec<LayerInfo>,
+
+    /// Opaque named metadata payloads that travel with the stream — an
+    /// ICC profile, Exif, XMP, IPTC, an audio track's cover art, or
+    /// any format-specific blob under a custom name. See
+    /// [`crate::blob`] for the mechanism and the payload convention of
+    /// each well-known [`BlobKind`]. Empty — the default — when the
+    /// producer found none.
+    ///
+    /// Set by the **producer**: a demuxer from the container's
+    /// metadata (a PNG `iCCP` chunk, a JPEG `APP1` segment, an MP4
+    /// `covr` atom, …), a still-image decoder for formats whose
+    /// metadata lives in the codestream, an encoder in
+    /// `output_params()` to hand the muxer what it should embed. The
+    /// framework never interprets the bytes; consumers route them by
+    /// kind through [`blob`](Self::blob) / [`blobs_of`](Self::blobs_of).
+    /// A per-frame [`VideoFrame::blob`](crate::VideoFrame::blob) of the
+    /// same kind, when present, refines the stream-level one.
+    ///
+    /// Not compared by [`matches_core`](Self::matches_core): like
+    /// `extradata`, descriptive metadata a lossless copy may rewrite.
+    pub blobs: Vec<MetadataBlob>,
 }
 
 impl CodecParameters {
@@ -499,6 +523,7 @@ impl CodecParameters {
             language: None,
             color_signal: ColorSignal::unspecified(),
             layers: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -544,6 +569,7 @@ impl CodecParameters {
             language: None,
             color_signal: ColorSignal::unspecified(),
             layers: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -572,6 +598,7 @@ impl CodecParameters {
             language: None,
             color_signal: ColorSignal::unspecified(),
             layers: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -599,6 +626,7 @@ impl CodecParameters {
             language: None,
             color_signal: ColorSignal::unspecified(),
             layers: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -645,6 +673,90 @@ impl CodecParameters {
     pub fn resolved_channels(&self) -> Option<u16> {
         self.channels
             .or_else(|| self.channel_layout.map(|l| l.channel_count()))
+    }
+
+    /// Fold a decoder's [`output_params`](crate::Decoder::output_params)
+    /// answer into these (stream / container) parameters. The decoder
+    /// produced the frames, so **it wins for every output-describing
+    /// field it sets**; fields it leaves `None` / unspecified keep the
+    /// container's value, and container-side fields are never touched.
+    ///
+    /// | field | rule |
+    /// |---|---|
+    /// | `width`, `height`, `pixel_format`, `frame_rate` | decoder's `Some` replaces |
+    /// | `sample_rate`, `channels`, `sample_format`, `channel_layout` | decoder's `Some` replaces; a kept layout / count that disagrees with the decoder's count is dropped / re-derived so the pair stays consistent |
+    /// | `color_signal` | field-wise: the decoder's specified parts over the container's ([`ColorSignal::or`]) |
+    /// | `layers` | the decoder's list replaces when non-empty |
+    /// | `codec_id`, `media_type`, `extradata`, `bit_rate`, `tag`, `language`, `blobs`, `options`, `limits`, `device_index` | kept |
+    ///
+    /// Returns `true` when any field of `self` changed — the signal a
+    /// consumer uses to reconfigure (converter, renderer, muxer).
+    ///
+    /// ```
+    /// # use oxideav_core::{CodecId, CodecParameters, PixelFormat};
+    /// // What the container said: codec + size, no pixel format.
+    /// let mut stream = CodecParameters::video(CodecId::new("h264"));
+    /// stream.width = Some(1920);
+    /// stream.height = Some(1088);
+    /// stream.bit_rate = Some(8_000_000);
+    /// // What the decoder resolved from the SPS (cropped size).
+    /// let mut out = CodecParameters::video(CodecId::new("h264"));
+    /// out.width = Some(1920);
+    /// out.height = Some(1080);
+    /// out.pixel_format = Some(PixelFormat::Yuv420P);
+    /// assert!(stream.merge_output_params(&out));
+    /// assert_eq!(stream.height, Some(1080));
+    /// assert_eq!(stream.pixel_format, Some(PixelFormat::Yuv420P));
+    /// assert_eq!(stream.bit_rate, Some(8_000_000));
+    /// assert!(!stream.merge_output_params(&out)); // idempotent
+    /// ```
+    pub fn merge_output_params(&mut self, decoded: &CodecParameters) -> bool {
+        fn take<T: Copy + PartialEq>(dst: &mut Option<T>, src: Option<T>) -> bool {
+            match src {
+                Some(v) if *dst != Some(v) => {
+                    *dst = Some(v);
+                    true
+                }
+                _ => false,
+            }
+        }
+        let mut changed = false;
+        changed |= take(&mut self.width, decoded.width);
+        changed |= take(&mut self.height, decoded.height);
+        changed |= take(&mut self.pixel_format, decoded.pixel_format);
+        changed |= take(&mut self.frame_rate, decoded.frame_rate);
+        changed |= take(&mut self.sample_rate, decoded.sample_rate);
+        changed |= take(&mut self.sample_format, decoded.sample_format);
+        changed |= take(&mut self.channels, decoded.channels);
+        changed |= take(&mut self.channel_layout, decoded.channel_layout);
+        // Keep the count / layout pair consistent when the decoder
+        // stated only one of them.
+        match (decoded.channels, decoded.channel_layout) {
+            (Some(n), None) => {
+                if self.channel_layout.is_some_and(|l| l.channel_count() != n) {
+                    self.channel_layout = None;
+                    changed = true;
+                }
+            }
+            (None, Some(l)) => {
+                let n = l.channel_count();
+                if self.channels.is_some_and(|c| c != n) {
+                    self.channels = Some(n);
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        let signal = decoded.color_signal.or(self.color_signal);
+        if signal != self.color_signal {
+            self.color_signal = signal;
+            changed = true;
+        }
+        if !decoded.layers.is_empty() && decoded.layers != self.layers {
+            self.layers = decoded.layers.clone();
+            changed = true;
+        }
+        changed
     }
 
     /// Read-only access to the DoS-protection caps for any decoder
@@ -790,6 +902,58 @@ impl CodecParameters {
     /// described) report `false`.
     pub fn is_multi_layer(&self) -> bool {
         self.layers.len() > 1
+    }
+
+    /// The stream's attached metadata [`blobs`](Self::blobs), in
+    /// producer order.
+    pub fn blobs(&self) -> &[MetadataBlob] {
+        &self.blobs
+    }
+
+    /// The first attached blob of `kind`, if any. For kinds that may
+    /// legitimately repeat (several `cover-art` pictures) iterate
+    /// [`blobs_of`](Self::blobs_of) instead.
+    ///
+    /// ```
+    /// # use oxideav_core::{BlobKind, CodecId, CodecParameters, MetadataBlob};
+    /// let p = CodecParameters::video(CodecId::new("png"))
+    ///     .with_blob(MetadataBlob::new(BlobKind::ICC, vec![0u8; 128]));
+    /// assert_eq!(p.blob(&BlobKind::ICC).map(|b| b.data.len()), Some(128));
+    /// assert!(p.blob(&BlobKind::EXIF).is_none());
+    /// ```
+    pub fn blob(&self, kind: &BlobKind) -> Option<&MetadataBlob> {
+        self.blobs.iter().find(|b| b.is(kind))
+    }
+
+    /// Every attached blob of `kind`, in producer order. Takes the kind
+    /// by value so `p.blobs_of(BlobKind::COVER_ART)` borrows nothing
+    /// but `self` (the constants are allocation-free).
+    pub fn blobs_of(&self, kind: BlobKind) -> impl Iterator<Item = &MetadataBlob> + '_ {
+        self.blobs.iter().filter(move |b| b.is(&kind))
+    }
+
+    /// Append a metadata blob. Blobs of the same kind are kept in
+    /// insertion order; nothing is replaced.
+    pub fn push_blob(&mut self, blob: MetadataBlob) {
+        self.blobs.push(blob);
+    }
+
+    /// Builder method: append a metadata blob (see
+    /// [`push_blob`](Self::push_blob)).
+    pub fn with_blob(mut self, blob: MetadataBlob) -> Self {
+        self.blobs.push(blob);
+        self
+    }
+
+    /// Builder method: replace the whole [`blobs`](Self::blobs) list.
+    pub fn with_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    /// Detach and return every attached blob, leaving the list empty.
+    pub fn take_blobs(&mut self) -> Vec<MetadataBlob> {
+        std::mem::take(&mut self.blobs)
     }
 }
 
@@ -939,18 +1103,26 @@ mod codec_parameters_device_index_tests {
 
     #[test]
     fn codec_parameters_device_index_defaults_to_none() {
-        assert!(CodecParameters::audio(CodecId::new("pcm_s16le"))
-            .device_index
-            .is_none());
-        assert!(CodecParameters::video(CodecId::new("h264"))
-            .device_index
-            .is_none());
-        assert!(CodecParameters::subtitle(CodecId::new("srt"))
-            .device_index
-            .is_none());
-        assert!(CodecParameters::data(CodecId::new("bin"))
-            .device_index
-            .is_none());
+        assert!(
+            CodecParameters::audio(CodecId::new("pcm_s16le"))
+                .device_index
+                .is_none()
+        );
+        assert!(
+            CodecParameters::video(CodecId::new("h264"))
+                .device_index
+                .is_none()
+        );
+        assert!(
+            CodecParameters::subtitle(CodecId::new("srt"))
+                .device_index
+                .is_none()
+        );
+        assert!(
+            CodecParameters::data(CodecId::new("bin"))
+                .device_index
+                .is_none()
+        );
     }
 
     #[test]
@@ -1003,18 +1175,26 @@ mod codec_parameters_language_tests {
 
     #[test]
     fn language_defaults_to_none_on_every_constructor() {
-        assert!(CodecParameters::audio(CodecId::new("aac"))
-            .language
-            .is_none());
-        assert!(CodecParameters::video(CodecId::new("h264"))
-            .language
-            .is_none());
-        assert!(CodecParameters::subtitle(CodecId::new("srt"))
-            .language
-            .is_none());
-        assert!(CodecParameters::data(CodecId::new("bin"))
-            .language
-            .is_none());
+        assert!(
+            CodecParameters::audio(CodecId::new("aac"))
+                .language
+                .is_none()
+        );
+        assert!(
+            CodecParameters::video(CodecId::new("h264"))
+                .language
+                .is_none()
+        );
+        assert!(
+            CodecParameters::subtitle(CodecId::new("srt"))
+                .language
+                .is_none()
+        );
+        assert!(
+            CodecParameters::data(CodecId::new("bin"))
+                .language
+                .is_none()
+        );
     }
 
     #[test]
@@ -1113,6 +1293,120 @@ mod codec_parameters_color_signal_tests {
             .with_layers(vec![LayerInfo::new(0), LayerInfo::new(1)]);
         assert!(a.matches_core(&b));
         assert!(b.matches_core(&a));
+    }
+
+    #[test]
+    fn matches_core_ignores_blobs() {
+        let a = CodecParameters::video(CodecId::new("png"));
+        let b = a
+            .clone()
+            .with_blob(MetadataBlob::new(BlobKind::ICC, vec![1, 2, 3]));
+        assert!(a.matches_core(&b));
+        assert!(b.matches_core(&a));
+        assert!(a.blobs().is_empty());
+        assert_eq!(b.blobs().len(), 1);
+    }
+
+    #[test]
+    fn blobs_accessors_push_lookup_iterate_take() {
+        let mut p = CodecParameters::audio(CodecId::new("mp3"));
+        assert!(p.blobs().is_empty());
+        assert!(p.blob(&BlobKind::COVER_ART).is_none());
+        assert_eq!(p.blobs_of(BlobKind::COVER_ART).count(), 0);
+
+        p.push_blob(
+            MetadataBlob::new(BlobKind::COVER_ART, vec![0xFF, 0xD8]).with_mime("image/jpeg"),
+        );
+        p.push_blob(MetadataBlob::new(
+            BlobKind::custom("id3-text"),
+            b"TIT2".to_vec(),
+        ));
+        p.push_blob(
+            MetadataBlob::new(BlobKind::COVER_ART, vec![0x89, b'P']).with_mime("image/png"),
+        );
+
+        // First of kind, in insertion order; every one of kind.
+        assert_eq!(
+            p.blob(&BlobKind::COVER_ART).and_then(|b| b.mime.as_deref()),
+            Some("image/jpeg")
+        );
+        let covers: Vec<&str> = p
+            .blobs_of(BlobKind::COVER_ART)
+            .filter_map(|b| b.mime.as_deref())
+            .collect();
+        assert_eq!(covers, ["image/jpeg", "image/png"]);
+        assert_eq!(
+            p.blob(&BlobKind::custom("id3-text"))
+                .map(|b| b.data.as_slice()),
+            Some(&b"TIT2"[..])
+        );
+        assert!(p.blob(&BlobKind::ICC).is_none());
+        assert_eq!(p.blobs().len(), 3);
+
+        // Field and accessor agree; clone carries the list.
+        assert_eq!(p.blobs, p.blobs().to_vec());
+        assert_eq!(p.clone().blobs().len(), 3);
+
+        // take empties; with_blobs replaces wholesale.
+        let taken = p.take_blobs();
+        assert_eq!(taken.len(), 3);
+        assert!(p.blobs().is_empty());
+        let q = p.with_blobs(vec![MetadataBlob::new(BlobKind::XMP, b"<x/>".to_vec())]);
+        assert_eq!(q.blobs().len(), 1);
+        assert!(q.blob(&BlobKind::XMP).is_some());
+    }
+
+    #[test]
+    fn every_constructor_starts_without_blobs() {
+        let id = CodecId::new("x");
+        for p in [
+            CodecParameters::audio(id.clone()),
+            CodecParameters::video(id.clone()),
+            CodecParameters::subtitle(id.clone()),
+            CodecParameters::data(id),
+        ] {
+            assert!(p.blobs().is_empty());
+        }
+    }
+
+    /// The same API carries an ICC profile on an image stream and cover
+    /// art on an audio stream: nothing in the mechanism is specific to
+    /// either medium or to any container.
+    #[test]
+    fn blobs_are_media_agnostic() {
+        let icc = vec![0u8; 16];
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+
+        let mut image = CodecParameters::video(CodecId::new("png"));
+        image.push_blob(MetadataBlob::new(BlobKind::ICC, icc.clone()));
+        let mut audio = CodecParameters::audio(CodecId::new("flac"));
+        audio.push_blob(
+            MetadataBlob::new(BlobKind::COVER_ART, jpeg.clone()).with_mime("image/jpeg"),
+        );
+
+        // One generic routine serves both streams.
+        fn first_payload<'a>(p: &'a CodecParameters, kind: &BlobKind) -> Option<&'a [u8]> {
+            p.blob(kind).map(|b| b.data.as_slice())
+        }
+        assert_eq!(first_payload(&image, &BlobKind::ICC), Some(icc.as_slice()));
+        assert_eq!(first_payload(&image, &BlobKind::COVER_ART), None);
+        assert_eq!(
+            first_payload(&audio, &BlobKind::COVER_ART),
+            Some(jpeg.as_slice())
+        );
+        assert_eq!(first_payload(&audio, &BlobKind::ICC), None);
+
+        // Moving a blob between streams of different media is a plain
+        // value move — the blob knows nothing about its carrier.
+        let moved = audio.take_blobs();
+        let image = image.with_blobs(moved);
+        assert_eq!(
+            image
+                .blob(&BlobKind::COVER_ART)
+                .and_then(|b| b.mime.as_deref()),
+            Some("image/jpeg")
+        );
+        assert!(image.blob(&BlobKind::ICC).is_none());
     }
 
     #[test]

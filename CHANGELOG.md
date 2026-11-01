@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Core fork reconciliation preserves `Yuv410P = 70` and display-duration
+  `stride == usize::MAX - 3`. Newly imported packed RGB formats use 71–82;
+  palette alpha uses `usize::MAX - 5`, while metadata blobs retain `MAX - 4`.
+  These differ from upstream's new allocations to preserve the fork's ABI.
 
 - `Decoder::output_video_dimensions()` exposes authoritative visible geometry
   without guessing from strides or extending frame literals. Its compatible
@@ -26,6 +30,203 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on screen from its `pts`, for bitmap subtitle decoders whose
   bitstream gives the end time when the frame is emitted (DVD stop
   command, DVB page time-out). Frames without it are unchanged.
+- **In-band `Frame::StreamParams(Box<CodecParameters>)` event** for
+  mid-stream changes of a decoder's output shape (frames stay lean — no
+  format fields per frame). A decoder whose output can change returns it
+  from `receive_frame` immediately before the first frame of the new
+  shape; never for the first shape (still announced by `output_params()`).
+  When it is returned, `output_params()` already answers the new shape and
+  `output_params_generation()` has already moved, so counter and event
+  agree; at most one event per change; same rule after `reset()` and while
+  draining after `flush()`. Boxed so `Frame` does not grow.
+- `Frame::stream_params() -> Option<&CodecParameters>` and
+  `Frame::is_stream_params()`; `Frame::pts()` answers `None` for the event.
+- `OutputParamsWatch::observe_frame(&Frame, &mut CodecParameters) -> bool`:
+  merges a `StreamParams` event into the stream, no-op for media frames;
+  mixing it with `observe()` reports each change once.
+- Contract docs: filters receiving the event re-plan (forwarding their own
+  event when their output shape changes) or reject with
+  `Error::Unsupported`; `Encoder::send_frame` rejects it with
+  `Error::Unsupported` unless the encoder can re-configure.
+
+### Changed
+
+- `Decoder::receive_arena_frame`'s default skips `StreamParams` events
+  (no arena representation) and returns the next frame.
+
+## [0.1.42](https://github.com/OxideAV/oxideav-core/compare/v0.1.41...v0.1.42) - 2026-10-25
+
+### Other
+
+- :output_params + output_params_generation: decoder-reported stream parameters, frames stay lean
+- edition 2024, MSRV 1.95
+
+### Changed
+
+- edition 2024, MSRV 1.95.
+
+### Added
+
+- **Decoder-reported stream parameters** — stream properties stay off the
+  frames (no width / height / format / rate repeated on every
+  `VideoFrame` / `AudioFrame`); the decoder states them once:
+  - `Decoder::output_params() -> Option<CodecParameters>` (default
+    method): the resolved description of the frames the decoder emits —
+    video width / height (the frames' cropped size), pixel format, frame
+    rate, colour signal, layers; audio sample rate, channels, sample
+    format, layout. Authoritative over the container's claim. The default
+    derives from `output_pixel_format()` (one-way — `output_params` reads
+    `output_pixel_format`, never the reverse), so decoders implementing
+    the narrow query are described for free; new decoders implement
+    `output_params` and forward `output_pixel_format` to it.
+  - `Decoder::output_params_generation() -> u64` (default `0`): a change
+    counter for mid-stream shape changes, bumped (wrapping) at a frame
+    boundary — visible together with the new `output_params()` when
+    `receive_frame` returns the first frame of the new shape. Resolving
+    the description before / at the first frame is not a change.
+  - `CodecParameters::merge_output_params(&CodecParameters) -> bool`:
+    folds the decoder's answer into a stream's parameters — the decoder's
+    `Some` wins for output-describing fields, the colour signal merges
+    field-wise, a stale channel count / layout is re-derived, container
+    fields (`codec_id`, `extradata`, `bit_rate`, `tag`, `language`,
+    `blobs`, …) are kept; returns whether anything changed.
+  - `OutputParamsWatch`: the consumer side in one call —
+    `observe(&decoder, &mut stream)` after every `receive_frame` reads the
+    description the first time and again only when the generation moved;
+    `prime` merges what is known before the first frame; `reset`.
+- `VideoFrame` / `AudioFrame` docs explain why frames carry no
+  stream-level properties and point to the decoder contract.
+
+## [0.1.41](https://github.com/OxideAV/oxideav-core/compare/v0.1.40...v0.1.41) - 2026-10-20
+
+### Other
+
+- :output_pixel_format: document its precedence over the container's pixel_format claim
+- the <producer>-<chunk> rule for custom kinds — format_native, producer, follows_naming_rule; the names in use documented
+- :embedded_blob_kinds: encoders declare which metadata blob kinds they embed
+- :set_metadata / carries_metadata_key: the write side of container text metadata
+- packed 16-bit 5-5-5 / 5-6-5 RGB+BGR in both byte orders, padded 32-bit RGB (Rgbx/Bgrx/Xrgb/Xbgr), is_packed_rgb / is_rgb
+- the semver job's comment no longer refers to a release-plz override (removed in 0bdaad9)
+- re-enable its semver check (user call); the CI cargo-semver-checks job stays
+
+### Added
+
+- **Packed 16-bit and padded 32-bit RGB `PixelFormat`s** (discriminants
+  70–81, appended): `Rgb555Le` / `Rgb555Be` / `Bgr555Le` / `Bgr555Be`
+  (5-5-5 in one 16-bit word, the top bit unused — never alpha) and
+  `Rgb565Le` / `Rgb565Be` / `Bgr565Le` / `Bgr565Be` (5-6-5), the name
+  listing the components from the word's most significant bits downward
+  and the suffix giving the word's byte order; `Rgbx` / `Bgrx` / `Xrgb` /
+  `Xbgr` (8-bit RGB plus one padding byte at the position the name spells,
+  the alpha-less twins of `Rgba` / `Bgra` / `Argb` / `Abgr`). All are
+  single-plane, `has_alpha() == false`, `plane_row_bytes` 2 × / 4 × width,
+  `bits_per_pixel_approx` 16 / 32. Native pixels of 16-bit bitmap files,
+  15/16-bit and attribute-less 32-bit TGA, and framebuffers; until now
+  such sources had to widen to `Rgb24` on the registry.
+- `PixelFormat::is_packed_rgb()` (single-plane interleaved RGB, alpha or
+  padding included) and `is_rgb()` (packed RGB or the planar GBR(A)
+  family), completing the family predicates next to `is_planar` /
+  `has_alpha` / `is_float` / `is_palette`.
+- **Muxer metadata hook**: `Muxer::set_metadata(&[(String, String)])`
+  (default-implemented, returns `Error::Unsupported` = the format carries
+  no text metadata, nothing stored) takes the ordered pairs
+  `Demuxer::metadata()` reports — same vocabulary, same slice type, so
+  `mux.set_metadata(demux.metadata())` is a remux — before `write_header`;
+  an overriding muxer keeps the pairs it has a field for and drops the rest
+  without error. `Muxer::carries_metadata_key(&str) -> bool` (default
+  `false`) answers "will this key survive the save?" before anything is
+  written. Format-native text (a comment extension, an annotation chunk, an
+  author field) now has a home other than a custom blob.
+- **Encoder blob declaration**: `CodecCapabilities::embedded_blob_kinds:
+  Vec<BlobKind>` (new field on the `#[non_exhaustive]` struct, empty by
+  default) with `with_embedded_blob_kind` / `with_embedded_blob_kinds`
+  (deduplicating), `embeds_blob(&BlobKind)` and `declares_embedded_blobs()`.
+  Empty means "nothing declared" (a gateway reports pass-through); a
+  populated list is a promise both ways — listed kinds are embedded when
+  present on the input, unlisted kinds dropped — so a caller can say
+  whether ICC / Exif / XMP survive a save before encoding.
+- **Custom blob-kind naming rule** `<producer>-<chunk>` documented on
+  `blob` (lower-case ASCII letters / digits / hyphens, the producing
+  crate's format name first) with the established names listed
+  (`gif-comment`, `tga-extension-area`, `tga-developer-area`,
+  `iff-<chunk>`); `BlobKind::format_native(producer, chunk)` builds one,
+  `producer()` reads the prefix back (`None` for well-known kinds),
+  `follows_naming_rule()` is the lexical check (every well-known constant
+  passes).
+
+### Changed
+
+- `Decoder::output_pixel_format` docs state its precedence: `Some` is a
+  fact about the frames to come and overrides the container's
+  `CodecParameters::pixel_format` claim; `None` means "not known yet",
+  not "the container was right". Behaviour unchanged (default `None`).
+
+## [0.1.40](https://github.com/OxideAV/oxideav-core/compare/v0.1.39...v0.1.40) - 2026-10-15
+
+### Other
+
+- disable its semver check (baseline was the yanked 0.2.0); CI gains a cargo-semver-checks job
+- Metadata blobs: named opaque payloads on CodecParameters and VideoFrame
+- VideoFrame palette alpha: per-entry alpha side-channel next to the palette
+
+### Added
+
+- **Palette alpha** on `VideoFrame`: a fifth in-band side-channel record
+  (`stride == usize::MAX - 3`, one alpha byte per palette entry, may be
+  shorter than the palette — uncovered entries are opaque) so indexed
+  images with transparent entries (GIF transparent index, PNG `tRNS` on
+  colour type 3, TGA / BMP alpha palettes) no longer render opaque through
+  the registry. `palette_alpha()` / `set_palette_alpha` /
+  `with_palette_alpha` / `take_palette_alpha`, the combined
+  `palette_rgba(index) -> Option<[u8; 4]>` (alpha `255` when absent) and
+  `set_palette_rgba(&[[u8; 4]])` / `with_palette_rgba` writing both
+  records. A record longer than the palette, or one without a palette,
+  reads as `None`; `image_planes()` / `image_plane_count()` exclude it
+  like every other record. The existing palette record is unchanged.
+- **Metadata blobs** (`oxideav_core::blob`, re-exported at the root):
+  `MetadataBlob { kind: BlobKind, mime: Option<String>, data: Vec<u8> }`
+  (`#[non_exhaustive]`, `new` / `with_mime` / `is`) and `BlobKind`, a
+  byte-compared name newtype with the well-known constants `ICC`,
+  `EXIF`, `XMP`, `IPTC`, `COVER_ART` (+ `WELL_KNOWN`, `from_static`,
+  `custom`, `as_str`, `is_well_known`, `Display`, `From<&'static str>` /
+  `From<String>`) and a documented format-neutral payload convention per
+  kind. The mechanism is generic — the kinds are examples; nothing in it
+  names a medium or a container.
+- `CodecParameters::blobs: Vec<MetadataBlob>` (new field on the
+  `#[non_exhaustive]` struct, empty by default) with `blobs()` /
+  `blob(&kind)` / `blobs_of(&kind)` / `push_blob` / `with_blob` /
+  `with_blobs` / `take_blobs`. Not part of `matches_core`.
+- `VideoFrame::blobs()` / `blob(&kind)` / `set_blobs` / `push_blob` /
+  `with_blob` / `with_blobs` / `take_blobs` — a sixth in-band
+  side-channel record (`stride == usize::MAX - 4`) holding the whole
+  list in the strict length-prefixed wire form `blob::encode_blobs` /
+  `blob::decode_blobs`, for per-picture metadata (multi-page TIFF Exif
+  per page, HEIF burst items with their own profile). A malformed record
+  reads as the empty list.
+
+### Fixed
+
+- `CodecParameters` docs no longer suggest functional-update
+  `CodecParameters { ..base }` syntax, which `#[non_exhaustive]` forbids
+  outside this crate.
+
+## [0.1.39](https://github.com/OxideAV/oxideav-core/compare/v0.1.38...v0.1.39) - 2026-10-06
+
+### Other
+
+- CodecCapabilities is #[non_exhaustive]; subtitle constructor + with_media_type
+
+### Changed
+
+- `CodecCapabilities` is `#[non_exhaustive]`: construct it with `audio` / `video` / the new `subtitle` constructor and the `with_*` builders (new: `with_media_type`). Adding a field (as 0.1.38 did) no longer breaks downstream struct literals — it already broke the published ass / sub-image crates once.
+
+## [0.1.38](https://github.com/OxideAV/oxideav-core/compare/v0.1.37...v0.1.38) - 2026-10-04
+
+### Other
+
+- :output_pixel_format: advertise the emitted layout up front
+- accepted_sample_rates / accepted_sample_formats for audio encoders
+- fix stale oxideav_codec trait links in execution module docs
 
 ## [0.1.37](https://github.com/OxideAV/oxideav-core/compare/v0.1.36...v0.1.37) - 2026-09-27
 

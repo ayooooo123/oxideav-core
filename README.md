@@ -17,8 +17,10 @@ pure-Rust media framework:
 * **`Frame`** — one uncompressed audio / video / subtitle chunk.
   `VideoFrame` can carry typed in-band side-channels alongside its
   pixel planes: a palette for palette-indexed (`Pal8`) content
-  (`palette()` / `set_palette` / `take_palette`) and a per-plane
-  significant-bits record for mixed depths no single `PixelFormat`
+  (`palette()` / `set_palette` / `take_palette`) with an optional
+  per-entry alpha record (`palette_alpha()` / `set_palette_alpha`,
+  `palette_rgba(i)` / `set_palette_rgba` — see [Palettes](#palettes))
+  and a per-plane significant-bits record for mixed depths no single `PixelFormat`
   names — e.g. 12-bit luma with 10-bit chroma from a custom signal
   range (`significant_bits()` / `set_significant_bits` /
   `take_significant_bits`, LSB-anchored values), a colour-signal
@@ -28,9 +30,19 @@ pure-Rust media framework:
   iterates pixel data side-channel-agnostically. See
   [Colour signal](#colour-signal) and
   [Layers and views](#layers-and-views).
+  Per-picture metadata blobs ride the same way (`blobs()` /
+  `set_blobs` / `push_blob` / `take_blobs`, see
+  [Metadata blobs](#metadata-blobs)).
 * **`StreamInfo`** / **`CodecParameters`** — what a demuxer advertises and
   what a decoder / encoder consumes, including the stream's
-  `color_signal` and its `layers` description.
+  `color_signal`, its `layers` description and its metadata `blobs`
+  (ICC / Exif / XMP / IPTC / cover art / custom).
+  A stream's `pixel_format` is the container's claim; a decoder that
+  knows what it will emit (configuration record, negotiated hardware
+  session, fixed output policy) states the fact with
+  `Decoder::output_pixel_format()`, which takes precedence, and an
+  encoder states what it takes with
+  `CodecCapabilities::accepted_pixel_formats`.
 * **`TimeBase`** / **`Timestamp`** / **`Rational`** — rational time per
   stream; timestamps are integers in that base. Named constants
   (`MILLIS` / `MICROS` / `NANOS` / `MPEG_TS` / `AUDIO_48K` / `AUDIO_44K1`
@@ -58,18 +70,24 @@ pure-Rust media framework:
   fraction. Property-tested against independent `i128` oracles (~200k
   edge-biased cases in `tests/props.rs`).
 * **`PixelFormat`** / **`SampleFormat`** — enum of supported raw formats
-  (70 pixel variants including 8/10/12/16-bit YUV at
+  (82 pixel variants including 8/10/12/16-bit YUV at
   4:2:0/4:2:2/4:4:4/4:1:1/4:4:0, YUV+alpha at 4:2:0/4:2:2/4:4:4 in both
   8-bit and deep 10/12/16-bit flavours, planar GBR(A) across the full
   8/10/12/14/16-bit depth ladder with an alpha companion at every
   depth, scene-referred 32-bit float gray/RGB(A)/planar-GBR(A) for
-  linear-light HDR, packed RGB/RGBA, gray+alpha at 8 and 16 bits, CMYK
-  in both ink conventions, NV12/NV21, all common sample layouts), plus
-  plane-geometry helpers on every variant: `chroma_subsampling()`
-  (log2 shifts per sampling class), `plane_dimensions()`
-  (ceil-division subsampled grids), and tightly-packed sizing via
-  `plane_row_bytes()` / `plane_size_bytes()` / `frame_size_bytes()`
-  with checked arithmetic.
+  linear-light HDR, packed RGB/RGBA, packed 16-bit 5-5-5 / 5-6-5 RGB
+  and BGR words in both byte orders (`Rgb555Le` … `Bgr565Be`), padded
+  32-bit RGB with one unused byte (`Rgbx` / `Bgrx` / `Xrgb` / `Xbgr`),
+  gray+alpha at 8 and 16 bits, CMYK in both ink conventions,
+  NV12/NV21, all common sample layouts), plus plane-geometry helpers
+  on every variant: `chroma_subsampling()` (log2 shifts per sampling
+  class), `plane_dimensions()` (ceil-division subsampled grids),
+  tightly-packed sizing via `plane_row_bytes()` / `plane_size_bytes()`
+  / `frame_size_bytes()` with checked arithmetic, and the family
+  predicates `is_packed_rgb()` / `is_rgb()` next to `is_planar()` /
+  `has_alpha()` / `is_float()` / `is_palette()`. The enum is
+  `#[non_exhaustive]` with pinned discriminants: variants are only
+  ever appended, so a `match` downstream needs a wildcard arm.
 * **`AttachedPicture`** / **`PictureType`** — ID3v2 `APIC` taxonomy
   shared by ID3v2 / FLAC / MP4 / Vorbis cover-art carriage. `PictureType`
   round-trips byte-for-byte through `from_u8` ↔ `to_u8` over the spec-
@@ -126,6 +144,33 @@ at the crate root, promoted to deny by CI's clippy gate) and
 `cargo doc` is warning-clean under docs.rs-strict settings.
 
 Zero C dependencies. Zero FFI. Zero `*-sys` crates.
+
+## Palettes
+
+Palette-indexed content (`PixelFormat::Pal8`) carries its colour table
+on the frame as two in-band side-channel records:
+
+* **Palette** (`stride == 0`) — packed RGB triplets, entry `i` at bytes
+  `3*i .. 3*i + 3`; `palette()` / `set_palette` / `with_palette` /
+  `take_palette`, per-entry `palette_rgb(i)`. Up to 256 entries;
+  producers attach exactly as many as the source declares.
+* **Palette alpha** (`stride == usize::MAX - 5` in this fork) — one alpha byte per
+  entry in the same order, for a GIF transparent index, a PNG `tRNS`
+  chunk on an indexed image, TGA / BMP alpha palettes;
+  `palette_alpha()` / `set_palette_alpha` / `with_palette_alpha` /
+  `take_palette_alpha`. The record may be **shorter** than the palette
+  (a GIF with transparent index 2 needs three bytes) and every entry it
+  does not cover is opaque. It is only meaningful next to a palette:
+  without one, or when it is **longer** than the palette's entry count,
+  it reads as `None` and consumers fall back to opaque. Validation is
+  at read time, so the two records may be attached in either order.
+
+`palette_rgba(i)` is the one lookup a `Pal8` → RGBA expander needs: the
+RGB triplet plus the alpha (`255` when absent), `None` exactly when
+`palette_rgb(i)` is. `set_palette_rgba(&[[u8; 4]])` /
+`with_palette_rgba` write both records from one RGBA table. Frames
+without a transparent entry attach no alpha record and stay
+byte-for-byte what they were.
 
 ## Colour signal
 
@@ -201,6 +246,80 @@ Both features are strictly additive: no existing field, signature or
 variant changed, `VideoFrame` remains constructible by struct literal,
 and `CodecParameters` gained its two fields behind its existing
 `#[non_exhaustive]` marker.
+
+## Container metadata
+
+Text metadata — the ordered `(key, value)` pairs a demuxer reports from
+`Demuxer::metadata()` (`title`, `artist`, `album`, `comment`, `date`,
+…) — now has a write side: `Muxer::set_metadata(&[(String, String)])`,
+called after construction and before `write_header`, so a remux is
+`mux.set_metadata(demux.metadata())`. The contract is best-effort and
+explicit about "nothing": the default returns `Error::Unsupported`
+(the format carries no text, nothing was stored — "not carried", not
+a failed write); a muxer with text fields keeps the pairs it has a
+field for, drops the rest without error and says which keys it writes;
+`Muxer::carries_metadata_key(key)` answers "will the title survive
+this save?" before anything is written (default `false`; override
+both together). A format's native text fields — a comment extension,
+an annotation chunk, an author field in a trailer — go through this
+hook; opaque payloads go through the blobs below, never the other way
+round.
+
+## Metadata blobs
+
+Formats embed metadata the framework cannot and should not parse — an
+ICC profile, an Exif block, an XMP packet, IPTC datasets, a track's
+cover art, a format's own attribute table. Module `blob` carries such
+payloads unchanged from the producer that found them to the consumer
+that wants them, on the same path the samples travel:
+
+* **`MetadataBlob { kind: BlobKind, mime: Option<String>, data: Vec<u8> }`**
+  (`#[non_exhaustive]`; `MetadataBlob::new(kind, data)` /
+  `with_mime`). `BlobKind` is a name compared byte-for-byte with
+  well-known constants `ICC`, `EXIF`, `XMP`, `IPTC`, `COVER_ART` and
+  `BlobKind::custom("exr-attributes")` for anything else. The
+  well-known kinds pin a **format-neutral payload** (the carrying
+  format's framing removed: an Exif blob starts at its byte-order mark
+  whether it came from a JPEG `APP1`, a PNG `eXIf` or a HEIF item; an
+  ICC blob is the complete profile file) so a blob lifted from one
+  format drops into another. The module docs hold the table.
+* **Stream** — `CodecParameters::blobs: Vec<MetadataBlob>` (empty by
+  default), with `blobs()` / `blob(&kind)` / `blobs_of(&kind)` /
+  `push_blob` / `with_blob` / `with_blobs` / `take_blobs`. Demuxers
+  fill it from the container, still-image decoders from the
+  codestream, encoders in `output_params()` so muxers know what to
+  embed. Not part of `matches_core`.
+* **Frame** — `VideoFrame::blobs()` / `blob(&kind)` / `set_blobs` /
+  `push_blob` / `with_blob` / `with_blobs` / `take_blobs`, an in-band
+  side-channel record (`stride == usize::MAX - 4`, wire form
+  `blob::encode_blobs` / `decode_blobs`) for pictures whose metadata is
+  genuinely per-picture — a multi-page TIFF's per-page Exif, HEIF burst
+  items with their own profile. A malformed record reads as the empty
+  list, never half a list. A frame blob refines the stream blob of the
+  same kind: `frame.blob(&k).or_else(|| params.blob(&k).cloned())`.
+
+* **Custom kinds** follow one rule, `<producer>-<chunk>`: the producing
+  crate's short format name, a hyphen, the native chunk the bytes come
+  from, lower-case ASCII (`gif-comment`, `tga-extension-area`,
+  `iff-camg`). `BlobKind::format_native("iff", "CAMG")` spells it,
+  `producer()` reads the prefix back, `follows_naming_rule()` checks
+  it; the module docs list the names in use so producers reuse rather
+  than reinvent. A container's *string* metadata is not a blob — see
+  [Container metadata](#container-metadata).
+* **Encoder declaration** — `CodecCapabilities::embedded_blob_kinds:
+  Vec<BlobKind>` (`with_embedded_blob_kind` / `with_embedded_blob_kinds`,
+  `embeds_blob(&kind)`, `declares_embedded_blobs()`): the kinds an
+  encoder reads from the input and writes into its output. Empty (the
+  default) is "nothing declared" — a gateway reports pass-through;
+  populated it is a promise both ways (listed kinds embedded when
+  present, unlisted kinds dropped), so "will the ICC profile survive
+  this save?" is answerable before a pixel is encoded.
+
+The mechanism is medium- and container-agnostic: the same API carries
+an ICC profile on an image stream and cover art on an audio stream, and
+nothing in core names a container. Container-level file attachments
+with filenames remain `Attachment`; the demuxer-level typed cover-art
+pathway remains `AttachedPicture`.
 
 ## Resolution order
 

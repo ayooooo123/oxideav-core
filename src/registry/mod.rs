@@ -13,12 +13,12 @@ pub mod source;
 
 pub use codec::{
     AudioFormat, CodecImplementation, CodecInfo, CodecRegistry, Decoder, DecoderFactory, Encoder,
-    EncoderFactory, PayloadMagicCandidate, TagCandidate,
+    EncoderFactory, OutputParamsWatch, PayloadMagicCandidate, TagCandidate,
 };
 pub use container::{
-    ContainerProbeFn, ContainerRegistry, Demuxer, ExtensionCandidate, Muxer, OpenDemuxerFn,
-    OpenMuxerFn, ProbeCandidate, ProbeData, ProbeScore, ReadSeek, WriteSeek, MAX_PROBE_SCORE,
-    PROBE_SCORE_EXTENSION,
+    ContainerProbeFn, ContainerRegistry, Demuxer, ExtensionCandidate, MAX_PROBE_SCORE, Muxer,
+    OpenDemuxerFn, OpenMuxerFn, PROBE_SCORE_EXTENSION, ProbeCandidate, ProbeData, ProbeScore,
+    ReadSeek, WriteSeek,
 };
 pub use context::RuntimeContext;
 pub use filter::{FilterFactory, FilterRegistry};

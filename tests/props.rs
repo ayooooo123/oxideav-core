@@ -5,10 +5,10 @@
 //! Deterministic: a fixed-seed LCG drives every case, so failures
 //! reproduce exactly.
 
+use oxideav_core::PixelFormat;
 use oxideav_core::bits::{BitReader, BitReaderLsb, BitWriter, BitWriterLsb};
 use oxideav_core::rational::Rational;
-use oxideav_core::time::{rescale, rescale_checked, rescale_rnd, Rounding, TimeBase, Timestamp};
-use oxideav_core::PixelFormat;
+use oxideav_core::time::{Rounding, TimeBase, Timestamp, rescale, rescale_checked, rescale_rnd};
 
 /// Minimal deterministic PRNG (64-bit LCG, high-bits output).
 struct Lcg(u64);
@@ -407,12 +407,16 @@ fn bits_msb_reader_never_panics_on_random_ops() {
 // ==================== VideoFrame side-channels ====================
 
 /// Model-based property run for the `VideoFrame` side-channels: random
-/// sequences of palette / significant-bits set/take operations checked
-/// against a trivially-correct model (two `Option<Vec<u8>>`s plus the
-/// frozen image planes). The two records must never interfere with each
-/// other or with the image planes, whatever order operations arrive in.
+/// sequences of palette / palette-alpha / significant-bits set/take
+/// operations checked against a trivially-correct model (three
+/// `Option<Vec<u8>>`s plus the frozen image planes). The records must
+/// never interfere with each other or with the image planes, whatever
+/// order operations arrive in; the palette-alpha record additionally
+/// reads as `None` whenever it is longer than the palette (or there is
+/// no palette), and `palette_rgba` falls back to opaque for every entry
+/// the alpha record does not cover.
 #[test]
-fn video_frame_side_channels_match_two_option_model() {
+fn video_frame_side_channels_match_three_option_model() {
     use oxideav_core::{VideoFrame, VideoPlane};
 
     let mut rng = Lcg::new(0xF3A7);
@@ -435,9 +439,16 @@ fn video_frame_side_channels_match_two_option_model() {
         let mut frame = VideoFrame { pts: None, planes };
         let mut model_palette: Option<Vec<u8>> = None;
         let mut model_bits: Option<Vec<u8>> = None;
+        // The raw alpha record as stored (the model of `planes`), and
+        // what the reader must report given the current palette.
+        let mut model_alpha_raw: Option<Vec<u8>> = None;
+        let model_alpha = |pal: &Option<Vec<u8>>, raw: &Option<Vec<u8>>| -> Option<Vec<u8>> {
+            let entries = pal.as_deref().map_or(0, |p| p.len() / 3);
+            raw.clone().filter(|a| entries > 0 && a.len() <= entries)
+        };
 
-        for _ in 0..40 {
-            match rng.next_u64() % 6 {
+        for _ in 0..60 {
+            match rng.next_u64() % 9 {
                 0 => {
                     // Attach/replace/clear the palette (empty clears).
                     let n = (rng.next_u64() % 4) as usize * 3;
@@ -474,7 +485,7 @@ fn video_frame_side_channels_match_two_option_model() {
                         model_bits.as_deref().and_then(|b| b.get(idx).copied())
                     );
                 }
-                _ => {
+                5 => {
                     let entry = rng.next_u64() as u8;
                     let expect = model_palette.as_deref().and_then(|p| {
                         let at = usize::from(entry) * 3;
@@ -482,11 +493,50 @@ fn video_frame_side_channels_match_two_option_model() {
                     });
                     assert_eq!(frame.palette_rgb(entry), expect);
                 }
+                6 => {
+                    // Attach/replace/clear the alpha record (empty
+                    // clears); lengths straddle the palette's entry
+                    // count so malformed records are exercised.
+                    let n = (rng.next_u64() % 5) as usize;
+                    let alpha: Vec<u8> = (0..n).map(|_| rng.next_u64() as u8).collect();
+                    model_alpha_raw = if alpha.is_empty() {
+                        None
+                    } else {
+                        Some(alpha.clone())
+                    };
+                    frame.set_palette_alpha(alpha);
+                }
+                7 => {
+                    // take reports what the reader would have, but
+                    // removes the record either way.
+                    let expect = model_alpha(&model_palette, &model_alpha_raw);
+                    model_alpha_raw = None;
+                    assert_eq!(frame.take_palette_alpha(), expect);
+                }
+                _ => {
+                    let entry = rng.next_u64() as u8 % 6;
+                    let alpha = model_alpha(&model_palette, &model_alpha_raw);
+                    let expect = model_palette.as_deref().and_then(|p| {
+                        let at = usize::from(entry) * 3;
+                        p.get(at..at + 3).map(|e| {
+                            let a = alpha
+                                .as_deref()
+                                .and_then(|a| a.get(usize::from(entry)).copied())
+                                .unwrap_or(255);
+                            [e[0], e[1], e[2], a]
+                        })
+                    });
+                    assert_eq!(frame.palette_rgba(entry), expect);
+                }
             }
 
             // Invariants after EVERY operation:
             assert_eq!(frame.palette(), model_palette.as_deref());
             assert_eq!(frame.significant_bits(), model_bits.as_deref());
+            assert_eq!(
+                frame.palette_alpha(),
+                model_alpha(&model_palette, &model_alpha_raw).as_deref()
+            );
             // Image planes are never touched by side-channel traffic.
             assert_eq!(frame.image_plane_count(), frozen.len());
             for (plane, (stride, data)) in frame.image_planes().iter().zip(&frozen) {
@@ -494,8 +544,99 @@ fn video_frame_side_channels_match_two_option_model() {
                 assert_eq!(&plane.data, data);
             }
             // Raw plane vector = image planes + one entry per record.
-            let records = usize::from(model_palette.is_some()) + usize::from(model_bits.is_some());
+            let records = usize::from(model_palette.is_some())
+                + usize::from(model_bits.is_some())
+                + usize::from(model_alpha_raw.is_some());
             assert_eq!(frame.planes.len(), frozen.len() + records);
+        }
+    }
+}
+
+// ==================== Metadata blob wire form ====================
+
+/// Random blob lists (random kinds — well-known and custom, including
+/// empty and non-ASCII names — optional mimes, random payloads up to a
+/// few KiB) round-trip through `encode_blobs` / `decode_blobs`
+/// byte-exactly, the frame side-channel reports the same list, and no
+/// proper prefix of the wire form decodes (a truncated record is
+/// unreadable, never a shorter list).
+#[test]
+fn metadata_blob_wire_form_round_trips_and_rejects_every_prefix() {
+    use oxideav_core::blob::{decode_blobs, encode_blobs};
+    use oxideav_core::{BlobKind, MetadataBlob, VideoFrame, VideoPlane};
+
+    let long = "x".repeat(300);
+    let names = [
+        "",
+        "icc",
+        "exif",
+        "cover-art",
+        "png-text",
+        "ünïcödé",
+        long.as_str(),
+    ];
+    let mut rng = Lcg::new(0xB10B);
+    for _ in 0..300 {
+        let count = (rng.next_u64() % 5) as usize;
+        let blobs: Vec<MetadataBlob> = (0..count)
+            .map(|_| {
+                let kind = match rng.next_u64() % 3 {
+                    0 => BlobKind::WELL_KNOWN[rng.next_u64() as usize % 5].clone(),
+                    _ => BlobKind::custom(names[rng.next_u64() as usize % names.len()]),
+                };
+                let len = match rng.next_u64() % 4 {
+                    0 => 0,
+                    1 => (rng.next_u64() % 8) as usize,
+                    _ => (rng.next_u64() % 3000) as usize,
+                };
+                let data: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+                let b = MetadataBlob::new(kind, data);
+                if rng.next_u64().is_multiple_of(2) {
+                    b.with_mime(names[rng.next_u64() as usize % names.len()])
+                } else {
+                    b
+                }
+            })
+            .collect();
+
+        let wire = encode_blobs(&blobs);
+        assert_eq!(decode_blobs(&wire).as_ref(), Some(&blobs));
+        assert_eq!(wire.is_empty(), blobs.is_empty());
+
+        // Through a frame: one record, image planes untouched.
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![VideoPlane {
+                stride: 2,
+                data: vec![0, 0, 0, 0],
+            }],
+        }
+        .with_blobs(blobs.clone());
+        assert_eq!(frame.blobs(), blobs);
+        assert_eq!(frame.image_plane_count(), 1);
+        assert_eq!(frame.planes.len(), 1 + usize::from(!blobs.is_empty()));
+        for b in &blobs {
+            assert_eq!(
+                frame.blob(&b.kind).as_ref(),
+                blobs.iter().find(|x| x.kind == b.kind)
+            );
+        }
+
+        // A handful of random proper prefixes, plus the shortest ones,
+        // all fail to decode.
+        if wire.len() > 1 {
+            for cut in [1usize, 2, 7, 8, 9, wire.len() - 1]
+                .into_iter()
+                .chain((0..8).map(|_| 1 + rng.next_u64() as usize % (wire.len() - 1)))
+                .filter(|&c| c < wire.len())
+            {
+                assert_eq!(
+                    decode_blobs(&wire[..cut]),
+                    None,
+                    "prefix {cut} of {}",
+                    wire.len()
+                );
+            }
         }
     }
 }
@@ -504,7 +645,7 @@ fn video_frame_side_channels_match_two_option_model() {
 
 /// Every `PixelFormat` variant, in discriminant order (mirrors the
 /// in-crate unit-test list; extend on every appended variant).
-const ALL_PIXEL_FORMATS: [PixelFormat; 71] = [
+const ALL_PIXEL_FORMATS: [PixelFormat; 83] = [
     PixelFormat::Yuv420P,
     PixelFormat::Yuv422P,
     PixelFormat::Yuv444P,
@@ -576,6 +717,18 @@ const ALL_PIXEL_FORMATS: [PixelFormat; 71] = [
     PixelFormat::GbrpF32Le,
     PixelFormat::GbrapF32Le,
     PixelFormat::Yuv410P,
+    PixelFormat::Rgb555Le,
+    PixelFormat::Rgb555Be,
+    PixelFormat::Bgr555Le,
+    PixelFormat::Bgr555Be,
+    PixelFormat::Rgb565Le,
+    PixelFormat::Rgb565Be,
+    PixelFormat::Bgr565Le,
+    PixelFormat::Bgr565Be,
+    PixelFormat::Rgbx,
+    PixelFormat::Bgrx,
+    PixelFormat::Xrgb,
+    PixelFormat::Xbgr,
 ];
 
 /// An edge-biased picture dimension: 0, 1, tiny odds, and sizes around

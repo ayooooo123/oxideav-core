@@ -1,12 +1,15 @@
 //! Uncompressed audio and video frames.
 
+use crate::blob::{BlobKind, MetadataBlob, decode_blobs, encode_blobs};
 use crate::layer::LayerIdentity;
 use crate::signal::ColorSignal;
 use crate::subtitle::SubtitleCue;
 use crate::vector::VectorFrame;
 
 /// A decoded chunk of uncompressed data: either audio samples, a video
-/// picture, or (for subtitle streams) a single styled cue.
+/// picture, (for subtitle streams) a single styled cue, a vector frame —
+/// or the in-band [`StreamParams`](Self::StreamParams) event announcing
+/// a mid-stream change of the output shape.
 ///
 /// Marked `#[non_exhaustive]` — consumers that match on variants must
 /// include a wildcard arm. This lets the crate add new frame kinds (data
@@ -28,6 +31,51 @@ pub enum Frame {
     /// `oxideav-pdf`) and consumed by vector renderers / writers.
     /// See [`crate::vector`] for the full primitive set.
     Vector(VectorFrame),
+    /// In-band announcement of a **mid-stream** change of the decoder's
+    /// output shape: the new resolved stream parameters (the same
+    /// description [`Decoder::output_params`](crate::Decoder::output_params)
+    /// now answers). It carries no picture or samples.
+    ///
+    /// Frames stay lean — width / height / pixel format / sample format
+    /// / rate are stated on the stream, not on every frame. The initial
+    /// shape is announced by `output_params()` (no event for it); this
+    /// event exists only so a consumer pulling frames sees a later change
+    /// in the frame stream itself, at the exact position it takes effect.
+    ///
+    /// The contract (for decoders that emit it — a decoder whose output
+    /// shape cannot change never does):
+    ///
+    /// * It is returned by [`Decoder::receive_frame`](crate::Decoder::receive_frame)
+    ///   only for a change **after the first frame** has been returned,
+    ///   **immediately before** the first `Video` / `Audio` frame of the
+    ///   new shape. The next media frame returned has the new shape; every
+    ///   frame returned before it had the old one.
+    /// * When it is returned, `output_params()` already describes the new
+    ///   shape and [`output_params_generation`](crate::Decoder::output_params_generation)
+    ///   has already been bumped — the counter and the event agree, so a
+    ///   consumer watching either sees exactly one change.
+    /// * At most one event per change; never one whose parameters equal
+    ///   the current shape.
+    /// * After [`reset`](crate::Decoder::reset) (a seek) the same rule
+    ///   applies relative to the shape of the last frame returned before
+    ///   the reset; draining after [`flush`](crate::Decoder::flush) keeps
+    ///   the ordering (queued old-shape frames, then the event, then the
+    ///   new-shape frames).
+    ///
+    /// Consumers fold it into the stream's parameters with
+    /// [`OutputParamsWatch::observe_frame`](crate::OutputParamsWatch::observe_frame)
+    /// (or [`CodecParameters::merge_output_params`](crate::CodecParameters::merge_output_params))
+    /// and re-plan converters / renderers. A filter receiving it re-plans
+    /// for the new input shape (forwarding its own `StreamParams` when its
+    /// output shape changes as a result) or rejects it with
+    /// [`Error::Unsupported`](crate::Error::Unsupported) when it cannot
+    /// adapt. An encoder's [`send_frame`](crate::Encoder::send_frame)
+    /// returns [`Error::Unsupported`](crate::Error::Unsupported) unless it
+    /// can re-configure for the new shape mid-stream.
+    ///
+    /// Boxed so the variant does not grow `Frame` (a [`CodecParameters`](crate::CodecParameters)
+    /// is larger than every media variant).
+    StreamParams(Box<crate::CodecParameters>),
 }
 
 impl Frame {
@@ -39,7 +87,25 @@ impl Frame {
             Self::Video(v) => v.pts,
             Self::Subtitle(s) => Some(s.start_us),
             Self::Vector(v) => v.pts,
+            Self::StreamParams(_) => None,
         }
+    }
+
+    /// The new stream parameters when this is a
+    /// [`StreamParams`](Self::StreamParams) event, `None` for a media
+    /// frame.
+    pub fn stream_params(&self) -> Option<&crate::CodecParameters> {
+        match self {
+            Self::StreamParams(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// `true` for a [`StreamParams`](Self::StreamParams) event — an
+    /// in-band announcement that carries no picture, samples, cue or
+    /// vector content.
+    pub fn is_stream_params(&self) -> bool {
+        matches!(self, Self::StreamParams(_))
     }
 }
 
@@ -49,6 +115,20 @@ impl Frame {
 /// time base) are NOT carried per-frame — read them from the stream's
 /// [`CodecParameters`](crate::CodecParameters). Frames stay lightweight
 /// because real-time playback moves thousands per second per stream.
+///
+/// This is deliberate, not an omission: a property that does not change
+/// from one frame to the next is stated once, on the stream, instead of
+/// being repeated on every frame. The decoder states what it actually
+/// emits through [`Decoder::output_params`](crate::Decoder::output_params)
+/// (sample rate, channels, sample format, layout — authoritative over
+/// the container's claim), and signals a mid-stream change (a chained
+/// stream switching sample rate) through
+/// [`Decoder::output_params_generation`](crate::Decoder::output_params_generation),
+/// one integer compared after `receive_frame`, and in-band through a
+/// [`Frame::StreamParams`] event returned just before the first frame
+/// of the new shape.
+/// [`OutputParamsWatch`](crate::OutputParamsWatch) folds them into the
+/// stream's parameters in one call per frame.
 ///
 /// Sample layout is determined by the stream's `SampleFormat`:
 /// - Interleaved formats: `data` has one plane; samples are stored as
@@ -76,6 +156,20 @@ pub struct AudioFrame {
 /// [`CodecParameters`](crate::CodecParameters). Frames stay lightweight
 /// because real-time playback moves thousands per second per stream.
 ///
+/// This is deliberate, not an omission: a property that does not change
+/// 60 times a second is stated once, on the stream, instead of being
+/// repeated on every frame. The decoder states what it actually emits
+/// through [`Decoder::output_params`](crate::Decoder::output_params)
+/// (the frames' width / height, pixel format, frame rate, colour signal
+/// — authoritative over the container's claim), and signals a
+/// mid-stream change (a resolution switch at a keyframe) through
+/// [`Decoder::output_params_generation`](crate::Decoder::output_params_generation),
+/// one integer compared after `receive_frame`, and in-band through a
+/// [`Frame::StreamParams`] event returned just before the first frame
+/// of the new shape.
+/// [`OutputParamsWatch`](crate::OutputParamsWatch) folds them into the
+/// stream's parameters in one call per frame.
+///
 /// # Side-channels
 ///
 /// `VideoFrame` (like [`VideoPlane`]) is a fully-public struct built by
@@ -89,13 +183,22 @@ pub struct AudioFrame {
 /// zero stride forces empty data) or a value above `isize::MAX`
 /// (`stride × rows` with any non-zero row count would exceed what a
 /// `Vec` can hold). The whole `stride > isize::MAX` band is reserved
-/// for side-channel tags. Five record kinds exist, distinguished by
+/// for side-channel tags. Seven record kinds exist, distinguished by
 /// their `stride` tag:
 ///
 /// - **Palette** — `stride == 0`. Carries the color table for
 ///   palette-indexed content
 ///   ([`PixelFormat::Pal8`](crate::PixelFormat::Pal8)); see
 ///   [`palette`](Self::palette) / [`set_palette`](Self::set_palette).
+/// - **Palette alpha** — `stride == usize::MAX - 5`. Carries one
+///   alpha byte per palette entry for tables with transparent or
+///   translucent entries (a GIF transparent index, a PNG `tRNS` chunk
+///   on a colour-type-3 image, TGA / BMP alpha palettes); entries the
+///   record does not cover are opaque. Only meaningful next to a
+///   palette record; see [`palette_alpha`](Self::palette_alpha) /
+///   [`set_palette_alpha`](Self::set_palette_alpha) and the combined
+///   [`palette_rgba`](Self::palette_rgba) /
+///   [`set_palette_rgba`](Self::set_palette_rgba).
 /// - **Per-plane significant bits** — `stride == usize::MAX`. Carries
 ///   mixed per-plane bit depths (e.g. 12-bit luma with 10-bit chroma
 ///   from a wavelet codec's custom signal range); see
@@ -116,6 +219,14 @@ pub struct AudioFrame {
 ///   that know it when they emit the frame (bitmap subtitles with an
 ///   end time); see [`display_duration`](Self::display_duration) /
 ///   [`set_display_duration`](Self::set_display_duration).
+/// - **Metadata blobs** — `stride == usize::MAX - 4`. Carries a list
+///   of [`MetadataBlob`]s (ICC profile, Exif, XMP, … — see
+///   [`crate::blob`]) for pictures whose metadata is per-picture: a
+///   multi-page TIFF's per-page Exif, HEIF burst items with their own
+///   profile. Wire form [`encode_blobs`] / [`decode_blobs`]; see
+///   [`blobs`](Self::blobs) / [`set_blobs`](Self::set_blobs). A blob
+///   that applies to the whole stream belongs on
+///   [`CodecParameters::blobs`](crate::CodecParameters::blobs) instead.
 ///
 /// The records compose: a frame can carry any subset at once, in any
 /// order, within the trailing run of side-channel-shaped entries. The
@@ -138,9 +249,9 @@ pub struct VideoFrame {
     pub pts: Option<i64>,
     /// One entry per plane (e.g., 3 for Yuv420P). Each entry is `(stride, bytes)`.
     ///
-    /// May additionally end with side-channel entries (palette,
-    /// per-plane significant bits, colour signal, layer identity,
-    /// display duration — see the type-level docs). Code that
+    /// May additionally end with side-channel entries (palette, palette
+    /// alpha, per-plane significant bits, colour signal, layer identity,
+    /// display duration, metadata blobs — see the type-level docs). Code that
     /// wants only pixel planes should iterate
     /// [`image_planes`](Self::image_planes) instead of this field.
     pub planes: Vec<VideoPlane>,
@@ -158,6 +269,11 @@ const LAYER_IDENTITY_STRIDE: usize = usize::MAX - 2;
 
 /// `stride` tag of the display-duration side-channel record.
 const DISPLAY_DURATION_STRIDE: usize = usize::MAX - 3;
+/// `stride` tag of the palette-alpha side-channel record.
+const PALETTE_ALPHA_STRIDE: usize = usize::MAX - 5;
+
+/// `stride` tag of the metadata-blobs side-channel record.
+const BLOBS_STRIDE: usize = usize::MAX - 4;
 
 /// Smallest `stride` value that is impossible for an image plane with
 /// at least one row: `stride × rows` would exceed `isize::MAX`, the
@@ -264,9 +380,124 @@ impl VideoFrame {
 
     /// Detach and return the frame's palette side-channel, if any.
     /// Afterwards the frame carries no palette (any other side-channel
-    /// record is left in place).
+    /// record is left in place — including a palette-alpha record,
+    /// which then reads as `None` until a palette is attached again).
     pub fn take_palette(&mut self) -> Option<Vec<u8>> {
         self.remove_side_channel(0)
+    }
+
+    /// Number of entries the attached palette covers (`len / 3`), or
+    /// `0` without a palette.
+    fn palette_entry_count(&self) -> usize {
+        self.palette().map_or(0, |p| p.len() / 3)
+    }
+
+    /// The frame's attached palette-alpha record, if any.
+    ///
+    /// Returns the raw bytes of the palette-alpha side-channel (see the
+    /// type-level docs): byte `i` is the alpha of palette entry `i`
+    /// (`0` transparent, `255` opaque), in the same entry order as
+    /// [`palette`](Self::palette). The record may be shorter than the
+    /// palette — a GIF with one transparent index needs only
+    /// `index + 1` bytes — and every entry it does not cover is opaque.
+    ///
+    /// The record is only meaningful next to a palette: it reads as
+    /// `None` when no palette is attached, and a malformed record
+    /// **longer** than the palette's entry count also reads as `None`
+    /// (consumers fall back to opaque). Validation happens at read
+    /// time, so palette and alpha may be attached in either order.
+    pub fn palette_alpha(&self) -> Option<&[u8]> {
+        let i = self.side_channel_index(PALETTE_ALPHA_STRIDE)?;
+        let alpha = self.planes[i].data.as_slice();
+        let entries = self.palette_entry_count();
+        (entries > 0 && alpha.len() <= entries).then_some(alpha)
+    }
+
+    /// The RGBA quadruplet for palette entry `index`: the RGB triplet
+    /// from the palette record and the alpha from the palette-alpha
+    /// record, or `255` (opaque) when no alpha record is attached, it
+    /// does not cover `index`, or it is malformed. `None` when no
+    /// palette is attached or the palette is too short to cover
+    /// `index` — exactly when [`palette_rgb`](Self::palette_rgb) is
+    /// `None`. The one lookup a `Pal8` → RGBA expander needs.
+    pub fn palette_rgba(&self, index: u8) -> Option<[u8; 4]> {
+        let [r, g, b] = self.palette_rgb(index)?;
+        let a = self
+            .palette_alpha()
+            .and_then(|a| a.get(usize::from(index)).copied())
+            .unwrap_or(u8::MAX);
+        Some([r, g, b, a])
+    }
+
+    /// Attach (or replace) the frame's palette-alpha side-channel.
+    ///
+    /// `alpha` holds one byte per palette entry, in entry order — see
+    /// [`palette_alpha`](Self::palette_alpha) for the semantics (may be
+    /// shorter than the palette; uncovered entries are opaque). The
+    /// bytes are stored verbatim; the length is checked against the
+    /// palette when read, not here, so the two records may be attached
+    /// in either order. An empty `alpha` removes any attached record
+    /// instead (the sentinel requires non-empty data). Other
+    /// side-channel records — the palette included — are unaffected.
+    pub fn set_palette_alpha(&mut self, alpha: Vec<u8>) {
+        self.remove_side_channel(PALETTE_ALPHA_STRIDE);
+        if !alpha.is_empty() {
+            self.planes.push(VideoPlane {
+                stride: PALETTE_ALPHA_STRIDE,
+                data: alpha,
+            });
+        }
+    }
+
+    /// Builder-style counterpart to
+    /// [`set_palette_alpha`](Self::set_palette_alpha) for construction
+    /// chains:
+    /// `VideoFrame { pts, planes }.with_palette(rgb).with_palette_alpha(alpha)`.
+    pub fn with_palette_alpha(mut self, alpha: Vec<u8>) -> Self {
+        self.set_palette_alpha(alpha);
+        self
+    }
+
+    /// Detach and return the frame's palette-alpha side-channel, if
+    /// any — the bytes [`palette_alpha`](Self::palette_alpha) would
+    /// have reported, so a record that read as `None` (no palette, or
+    /// longer than the palette) is removed but returns `None`.
+    /// Afterwards the frame carries no palette alpha (the palette and
+    /// every other record are left in place).
+    pub fn take_palette_alpha(&mut self) -> Option<Vec<u8>> {
+        let valid = self.palette_alpha().is_some();
+        self.remove_side_channel(PALETTE_ALPHA_STRIDE)
+            .filter(|_| valid)
+    }
+
+    /// Attach (or replace) both palette records at once from RGBA
+    /// entries: entry `i` of `rgba` becomes bytes `3*i .. 3*i + 3` of
+    /// the palette record and byte `i` of the palette-alpha record.
+    /// The alpha record is written even when every entry is opaque
+    /// (stored verbatim, no trimming). An empty `rgba` removes both
+    /// records.
+    ///
+    /// ```
+    /// # use oxideav_core::{VideoFrame, VideoPlane};
+    /// let mut f = VideoFrame { pts: None, planes: vec![VideoPlane { stride: 1, data: vec![1] }] };
+    /// f.set_palette_rgba(&[[0, 0, 0, 0], [255, 255, 255, 255]]);
+    /// assert_eq!(f.palette_rgba(0), Some([0, 0, 0, 0]));
+    /// assert_eq!(f.palette_rgba(1), Some([255, 255, 255, 255]));
+    /// assert_eq!(f.palette_rgba(2), None);
+    /// assert_eq!(f.image_plane_count(), 1);
+    /// ```
+    pub fn set_palette_rgba(&mut self, rgba: &[[u8; 4]]) {
+        let rgb = rgba.iter().flat_map(|e| [e[0], e[1], e[2]]).collect();
+        let alpha = rgba.iter().map(|e| e[3]).collect();
+        self.set_palette(rgb);
+        self.set_palette_alpha(alpha);
+    }
+
+    /// Builder-style counterpart to
+    /// [`set_palette_rgba`](Self::set_palette_rgba).
+    pub fn with_palette_rgba(mut self, rgba: &[[u8; 4]]) -> Self {
+        self.set_palette_rgba(rgba);
+        self
     }
 
     /// The frame's attached per-plane significant-bits record, if any.
@@ -484,9 +715,79 @@ impl VideoFrame {
         duration
     }
 
+    /// The frame's attached metadata blobs, decoded from the blobs
+    /// side-channel record (see the type-level docs; wire form in
+    /// [`encode_blobs`]). Empty when no record is attached — and when
+    /// the record is malformed, so a consumer never sees half a list.
+    /// Decodes on every call: read it once per frame.
+    ///
+    /// A per-frame blob refines the stream-level
+    /// [`CodecParameters::blobs`](crate::CodecParameters::blobs) of
+    /// the same kind: resolve
+    /// `frame.blob(&k).or_else(|| params.blob(&k).cloned())`.
+    pub fn blobs(&self) -> Vec<MetadataBlob> {
+        self.side_channel_index(BLOBS_STRIDE)
+            .and_then(|i| decode_blobs(&self.planes[i].data))
+            .unwrap_or_default()
+    }
+
+    /// The first attached blob of `kind`, if any (see
+    /// [`blobs`](Self::blobs)).
+    pub fn blob(&self, kind: &BlobKind) -> Option<MetadataBlob> {
+        self.blobs().into_iter().find(|b| b.is(kind))
+    }
+
+    /// Attach (or replace) the frame's metadata-blobs side-channel
+    /// with `blobs`, in the given order. An empty list removes any
+    /// attached record instead (the sentinel requires non-empty data).
+    /// Other side-channel records are unaffected.
+    pub fn set_blobs(&mut self, blobs: Vec<MetadataBlob>) {
+        self.remove_side_channel(BLOBS_STRIDE);
+        if !blobs.is_empty() {
+            self.planes.push(VideoPlane {
+                stride: BLOBS_STRIDE,
+                data: encode_blobs(&blobs),
+            });
+        }
+    }
+
+    /// Append one blob to the frame's metadata-blobs record (creating
+    /// it when absent; a malformed existing record is replaced by the
+    /// single new blob). Blobs of the same kind are kept in insertion
+    /// order; nothing is replaced.
+    pub fn push_blob(&mut self, blob: MetadataBlob) {
+        let mut blobs = self.blobs();
+        blobs.push(blob);
+        self.set_blobs(blobs);
+    }
+
+    /// Builder-style counterpart to [`push_blob`](Self::push_blob) for
+    /// construction chains:
+    /// `VideoFrame { pts, planes }.with_blob(MetadataBlob::new(BlobKind::EXIF, exif))`.
+    pub fn with_blob(mut self, blob: MetadataBlob) -> Self {
+        self.push_blob(blob);
+        self
+    }
+
+    /// Builder-style counterpart to [`set_blobs`](Self::set_blobs).
+    pub fn with_blobs(mut self, blobs: Vec<MetadataBlob>) -> Self {
+        self.set_blobs(blobs);
+        self
+    }
+
+    /// Detach and return the frame's metadata blobs, if any (empty for
+    /// no record or a malformed one — which is removed all the same).
+    /// Afterwards the frame carries no blobs record (other records are
+    /// left in place).
+    pub fn take_blobs(&mut self) -> Vec<MetadataBlob> {
+        self.remove_side_channel(BLOBS_STRIDE)
+            .and_then(|d| decode_blobs(&d))
+            .unwrap_or_default()
+    }
+
     /// The frame's image planes — `planes` with the trailing
-    /// side-channel entries (palette, significant bits, colour signal,
-    /// layer identity, display duration) excluded.
+    /// side-channel entries (palette, palette alpha, significant bits,
+    /// colour signal, layer identity, display duration, metadata blobs) excluded.
     /// Prefer this over indexing `planes` directly in code that
     /// handles side-channel-capable frames.
     pub fn image_planes(&self) -> &[VideoPlane] {
@@ -507,9 +808,9 @@ impl VideoFrame {
 ///
 /// An entry with non-empty `data` and a `stride` of `0` or above
 /// `isize::MAX` is not an image plane: it is a side-channel record
-/// (palette, per-plane significant bits, colour signal, layer identity,
-/// display duration) described on [`VideoFrame`] — only meaningful
-/// within the trailing run of `VideoFrame::planes`.
+/// (palette, palette alpha, per-plane significant bits, colour signal,
+/// layer identity, display duration, metadata blobs) described on
+/// [`VideoFrame`] — only meaningful within the trailing run of `VideoFrame::planes`.
 #[derive(Clone, Debug)]
 pub struct VideoPlane {
     /// Bytes per row in `data`.
@@ -983,6 +1284,452 @@ mod tests {
         if let Frame::Video(v) = wrapped {
             assert_eq!(v.color_signal(), Some(sig));
             assert_eq!(v.layer(), Some(id));
+        } else {
+            unreachable!("wrapped as Video above");
+        }
+    }
+
+    #[test]
+    fn frame_without_palette_alpha_reads_opaque() {
+        // No alpha record: palette_alpha is None and every covered
+        // entry is opaque through palette_rgba.
+        let f = gray_frame().with_palette(vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.palette_rgba(0), Some([1, 2, 3, 255]));
+        assert_eq!(f.palette_rgba(1), Some([4, 5, 6, 255]));
+        // Beyond the palette: None, exactly like palette_rgb.
+        assert_eq!(f.palette_rgba(2), None);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 2);
+
+        // No palette at all: no RGBA either.
+        let g = gray_frame();
+        assert_eq!(g.palette_alpha(), None);
+        assert_eq!(g.palette_rgba(0), None);
+    }
+
+    #[test]
+    fn set_palette_alpha_round_trips_and_keeps_image_planes_intact() {
+        // A GIF-style table: entry 2 is the transparent index, the
+        // record covers only entries 0..=2 and the rest stay opaque.
+        let mut f = gray_frame().with_palette(full_palette());
+        f.set_palette_alpha(vec![255, 255, 0]);
+
+        assert_eq!(f.palette_alpha(), Some(&[255, 255, 0][..]));
+        assert_eq!(f.palette_rgba(0), Some([0x00, 0xFF, 0x55, 255]));
+        assert_eq!(f.palette_rgba(2), Some([0x02, 0xFD, 0x57, 0]));
+        // Uncovered entries are opaque.
+        assert_eq!(f.palette_rgba(3), Some([0x03, 0xFC, 0x56, 255]));
+        assert_eq!(f.palette_rgba(255), Some([0xFF, 0x00, 0xAA, 255]));
+        // Image-plane view is unchanged; the raw field sees two records.
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.image_planes()[0].data.len(), 8);
+        assert_eq!(f.planes.len(), 3);
+        assert_eq!(f.planes[2].stride, usize::MAX - 5);
+        // The RGB record is untouched by the alpha record.
+        assert_eq!(f.palette().map(<[u8]>::len), Some(768));
+
+        // Replacement, not stacking.
+        f.set_palette_alpha(vec![128]);
+        assert_eq!(f.planes.len(), 3);
+        assert_eq!(f.palette_alpha(), Some(&[128][..]));
+        assert_eq!(f.palette_rgba(0), Some([0x00, 0xFF, 0x55, 128]));
+
+        // Empty input removes the record; the palette stays.
+        f.set_palette_alpha(Vec::new());
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.palette().map(<[u8]>::len), Some(768));
+
+        // take_palette_alpha detaches and returns the bytes.
+        f.set_palette_alpha(vec![0, 255]);
+        assert_eq!(f.take_palette_alpha(), Some(vec![0, 255]));
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.take_palette_alpha(), None);
+        assert_eq!(f.planes.len(), 2);
+    }
+
+    #[test]
+    fn palette_alpha_longer_than_palette_is_malformed_and_reads_none() {
+        // Two-entry palette, three alpha bytes: malformed → None, and
+        // palette_rgba falls back to opaque.
+        let mut f = gray_frame()
+            .with_palette(vec![1, 2, 3, 4, 5, 6])
+            .with_palette_alpha(vec![0, 0, 0]);
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.palette_rgba(0), Some([1, 2, 3, 255]));
+        assert_eq!(f.palette_rgba(1), Some([4, 5, 6, 255]));
+        // The entry is still side-channel-shaped: excluded from the
+        // image planes, present in the raw field.
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 3);
+        // Exactly as long as the palette is fine.
+        f.set_palette_alpha(vec![0, 7]);
+        assert_eq!(f.palette_alpha(), Some(&[0, 7][..]));
+        assert_eq!(f.palette_rgba(1), Some([4, 5, 6, 7]));
+        // Growing the palette afterwards makes a previously malformed
+        // record valid: validation is at read time.
+        f.set_palette_alpha(vec![0, 0, 0]);
+        assert_eq!(f.palette_alpha(), None);
+        f.set_palette(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(f.palette_alpha(), Some(&[0, 0, 0][..]));
+        // Taking a malformed record removes it but reports None.
+        f.set_palette(vec![1, 2, 3]);
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.take_palette_alpha(), None);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.palette(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn palette_alpha_without_palette_reads_none_in_either_order() {
+        // Alpha attached first (encoder scaffolding): meaningless until
+        // the palette arrives, then readable.
+        let mut f = gray_frame().with_palette_alpha(vec![0]);
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.palette_rgba(0), None);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 2);
+        f.set_palette(vec![9, 9, 9]);
+        assert_eq!(f.palette_alpha(), Some(&[0][..]));
+        assert_eq!(f.palette_rgba(0), Some([9, 9, 9, 0]));
+
+        // Detaching the palette orphans the alpha record: None again,
+        // still side-channel-shaped, and set_palette brings it back.
+        assert_eq!(f.take_palette(), Some(vec![9, 9, 9]));
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.image_plane_count(), 1);
+        f.set_palette(vec![1, 1, 1]);
+        assert_eq!(f.palette_alpha(), Some(&[0][..]));
+    }
+
+    #[test]
+    fn set_palette_rgba_writes_both_records() {
+        let table = [[10, 20, 30, 0], [40, 50, 60, 255], [70, 80, 90, 128]];
+        let mut f = gray_frame().with_palette_rgba(&table);
+        assert_eq!(f.palette(), Some(&[10, 20, 30, 40, 50, 60, 70, 80, 90][..]));
+        assert_eq!(f.palette_alpha(), Some(&[0, 255, 128][..]));
+        for (i, e) in table.iter().enumerate() {
+            assert_eq!(f.palette_rgba(i as u8), Some(*e));
+        }
+        assert_eq!(f.palette_rgba(3), None);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 3);
+
+        // Replaces an existing pair.
+        f.set_palette_rgba(&[[1, 2, 3, 4]]);
+        assert_eq!(f.planes.len(), 3);
+        assert_eq!(f.palette_rgba(0), Some([1, 2, 3, 4]));
+        assert_eq!(f.palette_rgba(1), None);
+
+        // Empty clears both.
+        f.set_palette_rgba(&[]);
+        assert_eq!(f.palette(), None);
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.planes.len(), 1);
+    }
+
+    #[test]
+    fn all_five_side_channels_compose_in_any_order() {
+        let sig = ColorSignal::bt709_limited();
+        let id = LayerIdentity::new(1).with_view_id(1);
+        // Alpha before palette, palette in the middle, every other
+        // record around them.
+        let mut f = gray_frame()
+            .with_palette_alpha(vec![0])
+            .with_layer(id)
+            .with_palette(vec![1, 2, 3, 4, 5, 6])
+            .with_color_signal(sig)
+            .with_significant_bits(vec![8]);
+        assert_eq!(f.planes.len(), 6);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.palette(), Some(&[1, 2, 3, 4, 5, 6][..]));
+        assert_eq!(f.palette_alpha(), Some(&[0][..]));
+        assert_eq!(f.palette_rgba(0), Some([1, 2, 3, 0]));
+        assert_eq!(f.palette_rgba(1), Some([4, 5, 6, 255]));
+        assert_eq!(f.significant_bits(), Some(&[8][..]));
+        assert_eq!(f.color_signal(), Some(sig));
+        assert_eq!(f.layer(), Some(id));
+
+        // Replacing records from the middle of the run leaves the
+        // others in place.
+        f.set_palette_alpha(vec![255, 0]);
+        f.set_color_signal(ColorSignal::srgb());
+        f.set_palette(vec![7, 8, 9, 10, 11, 12]);
+        assert_eq!(f.planes.len(), 6);
+        assert_eq!(f.palette_rgba(1), Some([10, 11, 12, 0]));
+        assert_eq!(f.significant_bits(), Some(&[8][..]));
+        assert_eq!(f.layer(), Some(id));
+        assert_eq!(f.color_signal(), Some(ColorSignal::srgb()));
+
+        // Detaching in an arbitrary order.
+        assert_eq!(f.take_layer(), Some(id));
+        assert_eq!(f.take_palette_alpha(), Some(vec![255, 0]));
+        assert_eq!(f.palette_rgba(1), Some([10, 11, 12, 255]));
+        assert_eq!(f.take_palette(), Some(vec![7, 8, 9, 10, 11, 12]));
+        assert_eq!(f.take_color_signal(), Some(ColorSignal::srgb()));
+        assert_eq!(f.take_significant_bits(), Some(vec![8]));
+        assert_eq!(f.planes.len(), 1);
+        assert_eq!(f.image_plane_count(), 1);
+
+        // Reverse construction order lands on the same answers.
+        let g = gray_frame()
+            .with_significant_bits(vec![8])
+            .with_color_signal(sig)
+            .with_palette(vec![1, 2, 3])
+            .with_layer(id)
+            .with_palette_alpha(vec![9]);
+        assert_eq!(g.planes.len(), 6);
+        assert_eq!(g.image_plane_count(), 1);
+        assert_eq!(g.palette_rgba(0), Some([1, 2, 3, 9]));
+        assert_eq!(g.significant_bits(), Some(&[8][..]));
+        assert_eq!(g.color_signal(), Some(sig));
+        assert_eq!(g.layer(), Some(id));
+    }
+
+    #[test]
+    fn palette_alpha_tag_with_empty_data_is_not_a_record() {
+        let f = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![0u8; 8],
+                },
+                VideoPlane {
+                    stride: usize::MAX - 5,
+                    data: Vec::new(),
+                },
+            ],
+        };
+        assert_eq!(f.palette_alpha(), None);
+        assert_eq!(f.image_plane_count(), 2);
+    }
+
+    #[test]
+    fn palette_alpha_survives_clone_and_frame_wrapping() {
+        let f = gray_frame().with_palette_rgba(&[[1, 2, 3, 0], [4, 5, 6, 255]]);
+        let cloned = f.clone();
+        assert_eq!(cloned.palette_alpha(), f.palette_alpha());
+        let wrapped = Frame::Video(cloned);
+        assert_eq!(wrapped.pts(), Some(7));
+        if let Frame::Video(v) = wrapped {
+            assert_eq!(v.palette_rgba(0), Some([1, 2, 3, 0]));
+            assert_eq!(v.palette_rgba(1), Some([4, 5, 6, 255]));
+        } else {
+            unreachable!("wrapped as Video above");
+        }
+    }
+
+    #[test]
+    fn frame_without_blobs_reads_empty() {
+        let f = gray_frame();
+        assert!(f.blobs().is_empty());
+        assert_eq!(f.blob(&BlobKind::ICC), None);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.planes.len(), 1);
+    }
+
+    #[test]
+    fn set_blobs_round_trips_and_keeps_image_planes_intact() {
+        let icc = MetadataBlob::new(BlobKind::ICC, vec![1, 2, 3, 4]);
+        let exif = MetadataBlob::new(BlobKind::EXIF, b"II*\0".to_vec());
+        let mut f = gray_frame();
+        f.set_blobs(vec![icc.clone(), exif.clone()]);
+
+        assert_eq!(f.blobs(), vec![icc.clone(), exif.clone()]);
+        assert_eq!(f.blob(&BlobKind::ICC), Some(icc.clone()));
+        assert_eq!(f.blob(&BlobKind::EXIF), Some(exif.clone()));
+        assert_eq!(f.blob(&BlobKind::XMP), None);
+        // Image-plane view is unchanged; the raw field sees one record
+        // holding the whole list, tagged usize::MAX - 4.
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.image_planes()[0].data.len(), 8);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.planes[1].stride, usize::MAX - 4);
+        assert_eq!(f.planes[1].data, encode_blobs(&[icc.clone(), exif.clone()]));
+
+        // Replacement, not stacking.
+        f.set_blobs(vec![exif.clone()]);
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.blobs(), vec![exif.clone()]);
+
+        // Empty input removes the record entirely.
+        f.set_blobs(Vec::new());
+        assert!(f.blobs().is_empty());
+        assert_eq!(f.planes.len(), 1);
+
+        // take_blobs detaches and returns the list.
+        f.set_blobs(vec![icc.clone()]);
+        assert_eq!(f.take_blobs(), vec![icc]);
+        assert!(f.blobs().is_empty());
+        assert!(f.take_blobs().is_empty());
+        assert_eq!(f.planes.len(), 1);
+    }
+
+    #[test]
+    fn push_blob_appends_in_order_and_with_blob_chains() {
+        let a = MetadataBlob::new(BlobKind::COVER_ART, vec![1]).with_mime("image/jpeg");
+        let b = MetadataBlob::new(BlobKind::COVER_ART, vec![2]).with_mime("image/png");
+        let c = MetadataBlob::new(BlobKind::custom("exr-attributes"), vec![3]);
+        let mut f = gray_frame().with_blob(a.clone());
+        f.push_blob(b.clone());
+        f.push_blob(c.clone());
+        // Same kind twice: both kept, first-of-kind lookup is stable.
+        assert_eq!(f.blobs(), vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(f.blob(&BlobKind::COVER_ART), Some(a));
+        assert_eq!(f.blob(&BlobKind::custom("exr-attributes")), Some(c));
+        // Still one record.
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.image_plane_count(), 1);
+    }
+
+    #[test]
+    fn malformed_blobs_record_reads_empty_and_is_replaced_by_push() {
+        let mut f = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![0u8; 8],
+                },
+                VideoPlane {
+                    stride: usize::MAX - 4,
+                    data: vec![9, 9, 9],
+                },
+            ],
+        };
+        // Side-channel-shaped (excluded from the image planes) but
+        // decodes to nothing.
+        assert_eq!(f.image_plane_count(), 1);
+        assert!(f.blobs().is_empty());
+        assert_eq!(f.blob(&BlobKind::ICC), None);
+        // push replaces the unreadable record with the single new blob.
+        let icc = MetadataBlob::new(BlobKind::ICC, vec![7]);
+        f.push_blob(icc.clone());
+        assert_eq!(f.planes.len(), 2);
+        assert_eq!(f.blobs(), vec![icc]);
+        // take on a malformed record removes it and reports empty.
+        f.planes[1].data = vec![9, 9, 9];
+        assert!(f.take_blobs().is_empty());
+        assert_eq!(f.planes.len(), 1);
+    }
+
+    #[test]
+    fn blobs_tag_with_empty_data_is_not_a_record() {
+        let f = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane {
+                    stride: 4,
+                    data: vec![0u8; 8],
+                },
+                VideoPlane {
+                    stride: usize::MAX - 4,
+                    data: Vec::new(),
+                },
+            ],
+        };
+        assert!(f.blobs().is_empty());
+        assert_eq!(f.image_plane_count(), 2);
+    }
+
+    #[test]
+    fn all_six_side_channels_compose_in_any_order() {
+        let sig = ColorSignal::bt709_limited();
+        let id = LayerIdentity::new(1).with_view_id(1);
+        let icc = MetadataBlob::new(BlobKind::ICC, vec![1, 2, 3]);
+        let xmp = MetadataBlob::new(BlobKind::XMP, b"<x/>".to_vec());
+        let mut f = gray_frame()
+            .with_blob(icc.clone())
+            .with_palette_alpha(vec![0])
+            .with_layer(id)
+            .with_palette(vec![1, 2, 3, 4, 5, 6])
+            .with_color_signal(sig)
+            .with_significant_bits(vec![8]);
+        assert_eq!(f.planes.len(), 7);
+        assert_eq!(f.image_plane_count(), 1);
+        assert_eq!(f.blobs(), vec![icc.clone()]);
+        assert_eq!(f.palette_rgba(0), Some([1, 2, 3, 0]));
+        assert_eq!(f.significant_bits(), Some(&[8][..]));
+        assert_eq!(f.color_signal(), Some(sig));
+        assert_eq!(f.layer(), Some(id));
+
+        // Growing the blobs list from the middle of the run leaves the
+        // others in place and keeps one record.
+        f.push_blob(xmp.clone());
+        f.set_color_signal(ColorSignal::srgb());
+        assert_eq!(f.planes.len(), 7);
+        assert_eq!(f.blobs(), vec![icc.clone(), xmp.clone()]);
+        assert_eq!(f.palette_rgba(1), Some([4, 5, 6, 255]));
+        assert_eq!(f.layer(), Some(id));
+        assert_eq!(f.color_signal(), Some(ColorSignal::srgb()));
+
+        // Detaching in an arbitrary order.
+        assert_eq!(f.take_palette(), Some(vec![1, 2, 3, 4, 5, 6]));
+        assert_eq!(f.blobs(), vec![icc.clone(), xmp.clone()]);
+        assert_eq!(f.take_blobs(), vec![icc, xmp]);
+        assert_eq!(f.take_layer(), Some(id));
+        assert_eq!(f.take_palette_alpha(), None); // orphaned → None, removed
+        assert_eq!(f.take_color_signal(), Some(ColorSignal::srgb()));
+        assert_eq!(f.take_significant_bits(), Some(vec![8]));
+        assert_eq!(f.planes.len(), 1);
+        assert_eq!(f.image_plane_count(), 1);
+    }
+
+    #[test]
+    fn all_seven_side_channels_preserve_fork_tags_without_collisions() {
+        use std::time::Duration;
+        let duration = Duration::new(15, 123);
+        let blob = MetadataBlob::new(BlobKind::ICC, vec![1, 2, 3]);
+        let id = LayerIdentity::new(1);
+        let signal = ColorSignal::bt709_limited();
+        let base = gray_frame()
+            .with_display_duration(duration)
+            .with_palette(vec![42; 36])
+            .with_palette_alpha(vec![7; 12])
+            .with_blob(blob.clone())
+            .with_layer(id)
+            .with_color_signal(signal)
+            .with_significant_bits(vec![8]);
+        assert_eq!(DISPLAY_DURATION_STRIDE, usize::MAX - 3);
+        assert_eq!(BLOBS_STRIDE, usize::MAX - 4);
+        assert_eq!(PALETTE_ALPHA_STRIDE, usize::MAX - 5);
+        for reverse in [false, true] {
+            for rotation in 0..7 {
+                let mut f = base.clone();
+                if reverse { f.planes[1..].reverse(); }
+                f.planes[1..].rotate_left(rotation);
+                assert_eq!(f.image_plane_count(), 1);
+                assert_eq!(f.display_duration(), Some(duration));
+                assert_eq!(f.palette_rgba(0), Some([42, 42, 42, 7]));
+                assert_eq!(f.blobs(), vec![blob.clone()]);
+                assert_eq!(f.color_signal(), Some(signal));
+                assert_eq!(f.layer(), Some(id));
+                assert_eq!(f.significant_bits(), Some(&[8][..]));
+                assert_eq!(f.take_display_duration(), Some(duration));
+                assert_eq!(f.take_palette_alpha(), Some(vec![7; 12]));
+                assert_eq!(f.take_blobs(), vec![blob.clone()]);
+                assert_eq!(f.take_palette(), Some(vec![42; 36]));
+                assert_eq!(f.take_layer(), Some(id));
+                assert_eq!(f.take_color_signal(), Some(signal));
+                assert_eq!(f.take_significant_bits(), Some(vec![8]));
+                assert_eq!(f.planes.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn blobs_survive_clone_and_frame_wrapping() {
+        let exif = MetadataBlob::new(BlobKind::EXIF, b"MM\0*".to_vec());
+        let f = gray_frame().with_blob(exif.clone());
+        let cloned = f.clone();
+        assert_eq!(cloned.blobs(), f.blobs());
+        let wrapped = Frame::Video(cloned);
+        assert_eq!(wrapped.pts(), Some(7));
+        if let Frame::Video(v) = wrapped {
+            assert_eq!(v.blob(&BlobKind::EXIF), Some(exif));
         } else {
             unreachable!("wrapped as Video above");
         }
