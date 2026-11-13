@@ -72,8 +72,17 @@ impl ExecutionContext {
     /// the plain serial path). This is the one clamp codecs use for
     /// every slice-/tile-/field-/GOP-parallel dispatch; querying host
     /// parallelism directly from codec code is out of contract.
+    #[inline(always)]
     pub fn effective_workers(&self, work_units: usize) -> usize {
-        self.threads.min(work_units).max(1)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = work_units;
+            1
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.threads.min(work_units).max(1)
+        }
     }
 }
 
